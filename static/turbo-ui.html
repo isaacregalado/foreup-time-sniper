@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbo Sniper — race control</title>
+<style>
+  :root {
+    --pine: #0B1D15;        /* pre-dawn course */
+    --pine-deep: #071009;   /* the dark under the trees */
+    --panel: #12271B;
+    --panel-2: #0E2016;
+    --line: rgba(241, 237, 224, .13);
+    --ink: #F1EDE0;         /* scorecard cream */
+    --muted: #8CA394;
+    --amber: #EFB54A;       /* scoreboard bulbs */
+    --brass-hi: #F2BE5A;    /* brass plate, lit edge */
+    --brass-lo: #D89A2E;    /* brass plate, shadow edge */
+    --flag: #E4573D;        /* real money / failure */
+    --fairway: #58B77C;     /* success */
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --display: "Avenir Next Condensed", "AvenirNextCondensed-Bold", "Arial Narrow", "Helvetica Neue", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { background: var(--pine-deep); }
+  body {
+    min-height: 100vh; padding: 22px clamp(14px, 3vw, 40px) 60px;
+    color: var(--ink); font-family: var(--sans);
+    background: radial-gradient(130% 80% at 50% -20%, #143224 0%, var(--pine) 48%, var(--pine-deep) 100%) fixed;
+  }
+
+  .eyebrow { font: 600 11px/1 var(--mono); letter-spacing: .22em; text-transform: uppercase; color: var(--muted); }
+
+  header { display: flex; align-items: baseline; gap: 14px; padding-bottom: 14px; border-bottom: 3px double var(--line); flex-wrap: wrap; }
+  header h1 { font: 700 30px/1 var(--display); letter-spacing: .10em; text-transform: uppercase; }
+  header h1 .flag { color: var(--fairway); }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .drop-clock { margin-left: auto; font: 500 13px var(--mono); color: var(--muted); }
+  header .drop-clock b { color: var(--amber); font-weight: 600; }
+
+  .grid { display: grid; grid-template-columns: 290px 1fr; gap: 18px; margin-top: 18px; align-items: start; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+
+  /* ── control rail ─────────────────────────── */
+  .rail { display: flex; flex-direction: column; gap: 14px; }
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line); border-radius: 12px; padding: 16px;
+    box-shadow: inset 0 1px 0 rgba(241, 237, 224, .05), 0 8px 24px -18px #000;
+  }
+  .card h2 { font-size: 12px; margin-bottom: 12px; }
+
+  .modes { display: flex; flex-direction: column; gap: 8px; }
+  .mode { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; background: transparent; }
+  .mode input { margin-top: 3px; accent-color: var(--amber); }
+  .mode .t { font-size: 13.5px; font-weight: 650; }
+  .mode .d { font-size: 12px; color: var(--muted); margin-top: 2px; line-height: 1.45; }
+  .mode.sel { border-color: var(--amber); background: rgba(239, 181, 74, .06); }
+  .mode.sel.live { border-color: var(--flag); background: rgba(228, 87, 61, .07); }
+
+  .cfg { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 12.5px; }
+  .cfg dt { color: var(--muted); }
+  .cfg dd { font-family: var(--mono); font-size: 12px; }
+  .cfg input[type=date] { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font: 600 11.5px var(--mono); color-scheme: dark; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { padding: 7px 14px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font: 650 12.5px var(--sans); cursor: pointer; transition: border-color .12s ease, background .12s ease; }
+  .chip:hover { border-color: rgba(241, 237, 224, .3); }
+  .chip.sel { border-color: var(--fairway); color: var(--ink); background: rgba(88, 183, 124, .1); }
+  /* Bethpage courses are literally named by color — let each chip select in its own */
+  #courses .chip[data-c=red].sel { border-color: var(--flag); background: rgba(228, 87, 61, .12); }
+  #courses .chip[data-c=black].sel { border-color: var(--ink); background: rgba(241, 237, 224, .09); }
+  .chip.crab.sel { border-color: var(--amber); background: rgba(239, 181, 74, .08); }
+  .chipnote { font-size: 11.5px; color: var(--muted); margin-top: 10px; line-height: 1.55; }
+  .chipnote b { color: var(--ink); font-weight: 650; }
+
+  .sched { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12px; color: var(--muted); flex-wrap: wrap; justify-content: center; }
+  .sched input[type=time] { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: 600 12.5px var(--mono); }
+  .sched button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--ink); font: 650 12px var(--sans); cursor: pointer; }
+  .sched button:hover { border-color: var(--amber); }
+  .sched .cancel { color: var(--flag); border-color: var(--flag); }
+  .sched .set { color: var(--amber); font-family: var(--mono); font-size: 12px; }
+
+  .histstats { font: 500 12px var(--mono); color: var(--muted); margin: 0 0 10px; }
+  .histstats b { color: var(--amber); font-weight: 600; }
+
+  .armbtn {
+    width: 100%; padding: 16px; border: 0; border-radius: 9px; cursor: pointer;
+    font: 700 19px/1 var(--display); letter-spacing: .14em; text-transform: uppercase;
+    background: linear-gradient(180deg, var(--brass-hi), var(--brass-lo)); color: #241A05;
+    box-shadow: inset 0 1px 0 rgba(255, 244, 214, .55), 0 10px 22px -12px rgba(239, 181, 74, .55);
+    transition: transform .08s ease, box-shadow .08s ease;
+  }
+  .armbtn:hover { transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255, 244, 214, .55), 0 14px 26px -12px rgba(239, 181, 74, .7); }
+  .armbtn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .armbtn.confirm { background: linear-gradient(180deg, #F0705A, #D2432C); color: #FFF3EC; box-shadow: inset 0 1px 0 rgba(255, 220, 210, .4), 0 10px 22px -12px rgba(228, 87, 61, .6); }
+  .armbtn.disarm { background: transparent; color: var(--flag); border: 1px solid var(--flag); box-shadow: none; }
+  .armnote { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; text-align: center; }
+
+  /* ── state panel (the signature) ──────────── */
+  /* Sticky + viewport-height: the verdict/console column rides along while the
+     rail scrolls — no dead space, and the result is never off-screen. */
+  .stage { background: linear-gradient(180deg, #102218, var(--panel-2)); border: 1px solid var(--line); border-radius: 14px; display: flex; flex-direction: column; overflow: hidden; position: sticky; top: 18px; height: calc(100vh - 36px); min-height: 480px; box-shadow: 0 18px 40px -30px #000; }
+  @media (max-width: 860px) { .stage { position: static; height: auto; } }
+  .stage-top { padding: 26px 26px 20px; border-bottom: 1px solid var(--line); min-height: 208px; display: flex; flex-direction: column; justify-content: center; position: relative; }
+  .phase-dot { position: absolute; top: 18px; left: 26px; display: flex; align-items: center; gap: 8px; }
+  .phase-dot i { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .phase-dot.on-idle i    { background: var(--muted); }
+  .phase-dot.on-run i     { background: var(--amber); animation: pulse 1.1s infinite; }
+  .phase-dot.on-good i    { background: var(--fairway); }
+  .phase-dot.on-bad i     { background: var(--flag); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .phase-dot i { animation: none !important; } }
+
+  /* The scoreboard plate — a club leaderboard's bulb clock. Digits sit on a
+     dark inset plate in a brass frame; arming warms the bulbs up. */
+  .bigclock {
+    display: inline-block; margin-top: 18px; padding: 18px 26px 16px; border-radius: 10px;
+    font: 700 clamp(44px, 8vw, 88px)/1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: .02em;
+    color: var(--ink); background: linear-gradient(180deg, #050D08, #081510);
+    border: 1px solid var(--brass-lo); outline: 1px solid rgba(0, 0, 0, .6);
+    box-shadow: inset 0 2px 10px rgba(0, 0, 0, .8), inset 0 -1px 0 rgba(241, 237, 224, .06), 0 1px 0 rgba(242, 190, 90, .25);
+    text-shadow: 0 0 14px rgba(241, 237, 224, .18);
+  }
+  .bigclock .dim { color: var(--muted); }
+  .bigclock.armed { color: var(--amber); text-shadow: 0 0 18px rgba(239, 181, 74, .55), 0 0 46px rgba(239, 181, 74, .22); }
+  .clock-label { margin-top: 12px; font: 600 11px/1 var(--mono); letter-spacing: .22em; text-transform: uppercase; color: var(--muted); }
+  .statusline { margin-top: 14px; font-size: 16.5px; font-weight: 650; }
+
+  .verdict { text-align: left; }
+  .verdict h3 { font: 700 clamp(46px, 8vw, 84px)/.95 var(--display); letter-spacing: .05em; text-transform: uppercase; }
+  .verdict.v-booked h3, .verdict.v-test_passed h3 { color: var(--fairway); }
+  .verdict.v-failed h3 { color: var(--flag); }
+  .verdict.v-manual h3, .verdict.v-ready_click h3 { color: var(--amber); }
+  .verdict.v-ready_click { animation: readypulse 1.4s ease-in-out infinite; }
+  @keyframes readypulse { 50% { opacity: .72; } }
+  @media (prefers-reduced-motion: reduce) { .verdict.v-ready_click { animation: none; } }
+  .verdict p { margin-top: 12px; font-size: 15px; line-height: 1.55; max-width: 60ch; }
+  .verdict .links { margin-top: 14px; font-size: 13px; }
+  .verdict .links a { color: var(--amber); }
+
+  .console { flex: 1; background: #081510; padding: 14px 18px; font: 12px/1.75 var(--mono); overflow-y: auto; min-height: 180px; white-space: pre-wrap; word-break: break-all; }
+  .console .ln-err { color: #F08D7A; }
+  .console .ln-ok { color: #8FD4A8; }
+  .console .ln-dim { color: var(--muted); }
+
+  /* ── playbook ─────────────────────────────── */
+  .playbook { margin-top: 18px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 860px) { .playbook { grid-template-columns: 1fr; } }
+  .step { background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid var(--line); border-radius: 12px; padding: 16px; box-shadow: inset 0 1px 0 rgba(241, 237, 224, .05); }
+  .step .when { font: 650 12px var(--mono); color: var(--amber); letter-spacing: .06em; }
+  .step h3 { font: 600 17px var(--display); letter-spacing: .04em; text-transform: uppercase; margin: 8px 0 6px; }
+  .step p { font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+  .step p b { color: var(--ink); font-weight: 650; }
+
+  /* ── history ──────────────────────────────── */
+  .history { margin-top: 26px; }
+  .history h2 { font-size: 12px; margin-bottom: 10px; }
+  .history .wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 640px; }
+  th { font: 600 10.5px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 14px; border-bottom: 1px solid rgba(241,237,224,.06); font-family: var(--mono); font-size: 12px; }
+  tbody tr:nth-child(odd) td { background: rgba(241, 237, 224, .022); }
+  tr:last-child td { border-bottom: 0; }
+  .r-good { color: var(--fairway); font-weight: 700; }
+  .r-bad { color: var(--flag); font-weight: 700; }
+  .r-mid { color: var(--amber); font-weight: 700; }
+  .empty { padding: 22px; color: var(--muted); font-size: 13px; }
+
+  .spec-option { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; background: rgba(241,237,224,.025); cursor: pointer; }
+  .spec-option input { margin-top: 3px; accent-color: var(--amber); }
+  .spec-option b { display: block; font: 650 12px var(--mono); color: var(--amber); letter-spacing: .04em; }
+  .spec-option span span { display: block; margin-top: 4px; color: var(--muted); font-size: 11.5px; line-height: 1.45; }
+  .spec-option:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+
+  a { color: var(--amber); }
+  button:focus-visible, .mode:focus-within, a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>TURBO SNIPER <span class="flag">⛳</span></h1>
+  <span class="sub">Bethpage race control · local only</span>
+  <span class="drop-clock">tee sheet drops daily at <b>7:00:00 PM</b> — 7 days out</span>
+</header>
+
+<div class="grid">
+  <!-- ── control rail ── -->
+  <div class="rail">
+    <div class="card">
+      <h2 class="eyebrow">Machine</h2>
+      <div class="chips" id="targets">
+        <button class="chip sel" data-t="mac">This Mac</button>
+        <button class="chip" data-t="aws">AWS us-west-2 <span id="aws-badge" style="font-weight:500;color:var(--muted)">…</span></button>
+        <button class="chip" data-t="oregon">GCP VM <span id="vm-badge" style="font-weight:500;color:var(--muted)">…</span></button>
+      </div>
+      <p class="chipnote" id="target-note">Runs here with a visible Chrome window — on a real booking <b>you</b> click PROCESS TRANSACTION.</p>
+      <div class="sched" style="margin-top:12px">
+        <button id="sync-aws-btn">Sync → AWS box</button>
+        <button id="sync-btn">Sync → GCP VM</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="eyebrow">Mode</h2>
+      <div class="modes" id="modes">
+        <label class="mode sel" data-mode="test">
+          <input type="radio" name="mode" value="test" checked>
+          <span><span class="t">Test run — $0</span>
+          <span class="d">Does everything real — races, holds an actual slot — then releases it before any charge. Run this at a 7pm drop before you trust it.</span></span>
+        </label>
+        <label class="mode" data-mode="live">
+          <input type="radio" name="mode" value="live">
+          <span><span class="t">Real booking</span>
+          <span class="d" id="live-desc">Wins the slot, enters the code, fills your card, then stops one click short — you click PROCESS TRANSACTION. $5/player is charged only on that click.</span></span>
+        </label>
+        <label class="mode" data-mode="dry">
+          <input type="radio" name="mode" value="dry">
+          <span><span class="t">Systems check</span>
+          <span class="d">Login, clock, email, tee-sheet access. No holds, runs any time of day, ~30 seconds.</span></span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="eyebrow">Where</h2>
+      <div class="chips" id="courses">
+        <button class="chip" data-c="red">Red</button>
+        <button class="chip" data-c="green">Green</button>
+        <button class="chip" data-c="black">Black</button>
+        <button class="chip crab" data-c="crab-meadow">Crab Meadow</button>
+      </div>
+      <p class="chipnote" id="course-note">Pick any mix of Bethpage courses — it races them all at once and keeps the best hold.</p>
+      <h2 class="eyebrow" style="margin:14px 0 10px">Players</h2>
+      <div class="chips" id="players">
+        <button class="chip" data-p="1">1</button>
+        <button class="chip" data-p="2">2</button>
+        <button class="chip" data-p="3">3</button>
+        <button class="chip" data-p="4">4</button>
+      </div>
+      <p class="chipnote">Only slots with this many open spots are taken. The booking fee is $5 × players.</p>
+      <h2 class="eyebrow" style="margin:14px 0 10px">Strike</h2>
+      <label class="spec-option">
+        <input type="checkbox" id="spec-toggle" checked>
+        <span><b>SPEC pre-aim preferred course</b><span>At T+150/450ms, try two predicted Red slots without waiting for detection. Bounded attempts; normal API detection remains the fallback.</span></span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h2 class="eyebrow">This run</h2>
+      <dl class="cfg" id="cfg">
+        <dt>Courses</dt><dd id="cfg-course">…</dd>
+        <dt>Window</dt><dd id="cfg-window">…</dd>
+        <dt>Players</dt><dd id="cfg-players">…</dd>
+        <dt>Strike</dt><dd id="cfg-spec">SPEC on</dd>
+        <dt>Date</dt><dd><input type="date" id="date-pick"> <span id="date-note" style="color:var(--muted)"></span></dd>
+        <dt>Card</dt><dd id="cfg-card">…</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <button class="armbtn" id="arm">Arm test run</button>
+      <p class="armnote" id="armnote">Chrome will open by itself — leave it alone unless the panel says otherwise.</p>
+      <div class="sched" id="sched">
+        <span>or auto-arm</span>
+        <select id="sched-day"><option value="today">today</option><option value="tomorrow">tomorrow</option></select>
+        <span>at</span>
+        <input type="time" id="sched-time" value="18:50">
+        <button id="sched-btn">Set</button>
+      </div>
+      <p class="armnote" id="schednote" style="display:none">While an auto-arm is set, this page’s server keeps your Mac awake. Leave it running.</p>
+    </div>
+  </div>
+
+  <!-- ── state panel ── -->
+  <div class="stage">
+    <div class="stage-top" id="stage">
+      <div class="phase-dot on-idle" id="dot"><i></i><span class="eyebrow" id="dot-label">standing by</span></div>
+      <div id="stage-body">
+        <div class="bigclock" id="clock">--:--:--</div>
+        <div class="clock-label" id="clock-label">until tonight’s 7:00pm drop</div>
+        <div class="statusline" id="statusline">Not armed. Pick a mode and arm when you’re ready.</div>
+      </div>
+    </div>
+    <div class="console" id="console"><span class="ln-dim">Log will stream here when you arm.</span></div>
+  </div>
+</div>
+
+<!-- ── playbook: the actual Sunday sequence ── -->
+<section class="playbook">
+  <div class="step">
+    <div class="when">FIRST · ANY DAY</div>
+    <h3>Prove the plumbing</h3>
+    <p>Run <b>Systems check</b> right now. Then, at any evening’s 7:00pm drop, run <b>Test run — $0</b>. When both pass you have proof the whole chain works, receipts included in the history below.</p>
+  </div>
+  <div class="step">
+    <div class="when">SUNDAY · 6:45 PM</div>
+    <h3>Pick a machine, arm, sit back</h3>
+    <p><b>This Mac</b> keeps the final click yours. <b>AWS us-west-2</b> sits in ForeUp’s own datacenter (~2ms — the fastest machine you can be) and books entirely by itself ($5/player, no confirmation click); <b>GCP VM</b> is the ~28ms backup. Never arm two — ForeUp allows one held slot per account, so they’d fight over it.</p>
+  </div>
+  <div class="step">
+    <div class="when">SUNDAY · 7:00:30 PM</div>
+    <h3>Make (or watch) the final click</h3>
+    <p><b>ONE CLICK LEFT</b> (Mac): switch to Chrome, click PROCESS TRANSACTION — the only step that charges. <b>BOOKED</b> (VM): check your email for the confirmation. <b>DID NOT BOOK</b>: $0 spent, try the next drop. <b>FINISH BY HAND</b>: continue in the open window.</p>
+  </div>
+</section>
+
+<!-- ── history ── -->
+<section class="history">
+  <h2 class="eyebrow">Run history</h2>
+  <div class="wrap"><div id="history"><div class="empty">No runs recorded yet — every armed run lands here with its timing splits.</div></div></div>
+</section>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let mode = 'test';
+  let target = 'mac';
+  let spec = true;
+  let running = false;
+  let confirmTimer = null;
+  let cardOk = false;
+
+  let host = 'mac'; // 'mac' = laptop dashboard; 'vm' = this page served from the Oregon VM
+  const MODE_LABEL = { test: 'Arm test run', live: 'Arm real booking', dry: 'Run systems check' };
+  const TARGET_NOTE = {
+    mac: 'Runs here with a visible Chrome window — on a real booking YOU click PROCESS TRANSACTION.',
+    oregon: 'Runs headless in GCP us-west1 (~28ms to ForeUp), inside tmux — it SURVIVES this Mac sleeping or wifi drops (press Arm again to reattach to a live run). A real booking is FULLY AUTOMATIC: it clicks the $5/player fee itself (card must be in .env and synced).',
+    aws: 'THE FAST ONE: headless in AWS us-west-2 — ForeUp’s own region, ~2ms away, same footing as the best bots. tmux-hardened (survives Mac sleep; Arm again reattaches). A real booking is FULLY AUTOMATIC: it clicks the $5/player fee itself (card must be in .env and synced).',
+  };
+  const LIVE_DESC = {
+    mac: 'Wins the slot, enters the code, fills your card, then stops one click short — you click PROCESS TRANSACTION. $5/player is charged only on that click.',
+    oregon: 'Wins the slot and completes the $5/player fee payment BY ITSELF on the GCP VM — no human click. Use when speed matters more than keeping the final say.',
+    aws: 'Wins the slot and completes the $5/player fee payment BY ITSELF from inside ForeUp’s own datacenter — no human click. This is the machine that beats other bots.',
+  };
+  const VM_HOST_NOTE = 'You are on the Oregon VM’s own dashboard (always on, ~3× closer to ForeUp). Runs are headless: a real booking is FULLY AUTOMATIC — it clicks the $5/player fee itself.';
+  const RESULTS = {
+    booked: ['BOOKED', 'r-good'], booked_dom_fallback: ['BOOKED (fallback)', 'r-good'],
+    ready_for_click: ['ONE CLICK LEFT', 'r-mid'],
+    no_book_abort: ['TEST PASSED', 'r-good'],
+    manual_needed: ['NEEDED HAND-FINISH', 'r-mid'],
+    no_hold: ['LOST RACE', 'r-bad'], hold_failed: ['LOST RACE', 'r-bad'],
+    no_times: ['NO TIMES', 'r-bad'], window_empty: ['WINDOW EMPTY', 'r-bad'],
+    mismatch_players: ['SAFETY ABORT', 'r-mid'], mismatch_time: ['SAFETY ABORT', 'r-mid'], mismatch_schedule: ['SAFETY ABORT', 'r-mid'],
+    no_email_code: ['NO EMAIL CODE', 'r-bad'], crash: ['CRASHED', 'r-bad'],
+    dry_run_ok: ['SYSTEMS CHECK OK', 'r-good'], booked_nofee: ['BOOKED', 'r-good'],
+  };
+
+  // ── machine picker + VM status ──
+  function renderTarget() {
+    document.querySelectorAll('#targets .chip').forEach((el) => el.classList.toggle('sel', el.dataset.t === target));
+    $('target-note').innerHTML = TARGET_NOTE[target];
+    $('live-desc').textContent = LIVE_DESC[target];
+    resetArmButton();
+  }
+  $('targets').addEventListener('click', (e) => {
+    const t = e.target.closest('.chip')?.dataset?.t;
+    if (!t || running) return;
+    target = t;
+    renderTarget();
+  });
+  let cardInfo = { present: false, valid: false, issues: [] };
+  function renderCardRow() {
+    const cc = $('cfg-card');
+    if (!cc) return;
+    if (!cardInfo.present) { cc.textContent = 'NOT in .env — you type it'; cc.style.color = 'var(--amber)'; }
+    else if (!cardInfo.valid) { cc.textContent = '⚠ ' + cardInfo.issues.join('; '); cc.style.color = 'var(--flag)'; }
+    else { cc.textContent = 'in .env, validated — will be pre-filled'; cc.style.color = 'var(--fairway)'; }
+  }
+  function applyCard(info) { cardInfo = info ?? cardInfo; cardOk = cardInfo.present && cardInfo.valid; renderCardRow(); }
+  function pollVm() {
+    fetch('/api/vm').then((r) => r.json()).then((v) => {
+      applyCard(v.card);
+      const up = v.status === 'RUNNING';
+      $('vm-badge').textContent = up ? '●' : '○';
+      $('vm-badge').style.color = up ? 'var(--fairway)' : 'var(--flag)';
+      $('vm-badge').title = `GCP VM ${v.status}`;
+    }).catch(() => {});
+  }
+  function pollAws() {
+    fetch('/api/aws').then((r) => r.json()).then((a) => {
+      const up = a.status === 'running';
+      $('aws-badge').textContent = up ? '●' : '○';
+      $('aws-badge').style.color = up ? 'var(--fairway)' : 'var(--flag)';
+      $('aws-badge').title = `AWS box ${a.status}${a.ip ? ' · ' + a.ip : ''}`;
+    }).catch(() => {});
+  }
+  function applyHost() {
+    if (host !== 'vm') { pollVm(); pollAws(); setInterval(pollVm, 30_000); setInterval(pollAws, 30_000); return; }
+    // This page IS a remote box: no remote targets, no sync, everything is headless.
+    document.querySelector('#targets .chip[data-t=mac]').textContent = 'This VM (Oregon)';
+    document.querySelector('#targets .chip[data-t=oregon]').style.display = 'none';
+    document.querySelector('#targets .chip[data-t=aws]').style.display = 'none';
+    $('sync-btn').style.display = 'none';
+    $('sync-aws-btn').style.display = 'none';
+    TARGET_NOTE.mac = VM_HOST_NOTE;
+    LIVE_DESC.mac = LIVE_DESC.oregon;
+    document.querySelector('header .sub').textContent = 'Bethpage race control · OREGON VM';
+    renderTarget();
+  }
+  function bindSync(btnId, tgt, label) {
+    $(btnId).addEventListener('click', async () => {
+      const b = $(btnId);
+      b.disabled = true; b.textContent = 'Syncing…';
+      const r = await fetch('/api/vm/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: tgt }) }).then((r) => r.json());
+      if (!r.ok) { alert(r.error); b.disabled = false; b.textContent = label; }
+    });
+  }
+  bindSync('sync-btn', 'oregon', 'Sync → GCP VM');
+  bindSync('sync-aws-btn', 'aws', 'Sync → AWS box');
+
+  // ── players picker ──
+  let players = 4;
+  let cfgHoles = '18';
+  function renderPlayers() {
+    document.querySelectorAll('#players .chip').forEach((el) => el.classList.toggle('sel', Number(el.dataset.p) === players));
+    $('cfg-players').textContent = `${players} players · ${cfgHoles} holes`;
+    resetArmButton();
+  }
+  $('players').addEventListener('click', (e) => {
+    const p = Number(e.target.closest('.chip')?.dataset?.p);
+    if (!p || running) return;
+    players = p;
+    renderPlayers();
+  });
+
+  // ── date picker: defaults to the drop day (+7); anything else is a
+  //    leftovers hunt (earlier) or Crab Meadow's longer window (up to +8) ──
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const isoPlusDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+  function pickedDate() { // ISO → turbo's MM-DD-YYYY
+    const v = $('date-pick').value;
+    if (!v) return undefined;
+    const [y, m, d] = v.split('-');
+    return `${m}-${d}-${y}`;
+  }
+  function renderDateNote() {
+    const v = $('date-pick').value;
+    if (!v) { $('date-note').textContent = '(auto: +7)'; return; }
+    const diff = Math.round((new Date(v + 'T12:00') - new Date(isoPlusDays(0) + 'T12:00')) / 864e5);
+    $('date-note').textContent = diff === 7 ? 'drop day (+7)' : diff < 7 ? `+${diff}d — sheet already live` : `+${diff}d — drops ${diff - 7}d from now`;
+    $('date-note').style.color = diff === 7 ? 'var(--muted)' : 'var(--amber)';
+  }
+  $('date-pick').addEventListener('change', renderDateNote);
+
+  // ── course picker: Bethpage courses mix freely; Crab Meadow is exclusive ──
+  let courses = ['red', 'green'];
+  const CRAB_NOTE = 'Separate ForeUp facility — needs your account to exist there, one course, no email code (books faster). If you get a Huntington cardholder, set CRABMEADOW_BOOKING_CLASS_ID=10786 in .env: 15-day booking window, no race at all.';
+  const BP_NOTE = 'Pick any mix of Bethpage courses — it races them all at once and keeps the best hold.';
+  function renderCourses() {
+    document.querySelectorAll('#courses .chip').forEach((el) => el.classList.toggle('sel', courses.includes(el.dataset.c)));
+    $('course-note').textContent = courses.includes('crab-meadow') ? CRAB_NOTE : BP_NOTE;
+    $('cfg-course').textContent = courses.join(' + ');
+    renderSpec();
+  }
+  $('courses').addEventListener('click', (e) => {
+    const c = e.target.dataset?.c;
+    if (!c || running) return;
+    if (c === 'crab-meadow') courses = ['crab-meadow'];
+    else {
+      courses = courses.filter((x) => x !== 'crab-meadow');
+      courses = courses.includes(c) ? courses.filter((x) => x !== c) : [...courses, c];
+      if (!courses.length) courses = [c]; // never allow zero courses
+    }
+    renderCourses();
+  });
+
+  // ── SPEC strategy toggle (explicitly sent to arm + schedule) ──
+  function renderSpec() {
+    const toggle = $('spec-toggle');
+    const unsupported = courses.includes('crab-meadow');
+    if (unsupported) { spec = false; toggle.checked = false; }
+    toggle.disabled = unsupported || running;
+    $('cfg-spec').textContent = unsupported ? 'not mapped for Crab Meadow' : spec ? `on · pre-aim ${courses[0] ?? 'preferred'}` : 'off · detect first';
+    resetArmButton();
+  }
+  $('spec-toggle').addEventListener('change', (e) => {
+    if (running || courses.includes('crab-meadow')) return;
+    spec = e.target.checked;
+    renderSpec();
+  });
+
+  // ── mode picker ──
+  $('modes').addEventListener('change', (e) => {
+    mode = e.target.value;
+    document.querySelectorAll('.mode').forEach((el) => el.classList.toggle('sel', el.dataset.mode === mode));
+    document.querySelector('.mode[data-mode=live]').classList.toggle('live', mode === 'live');
+    resetArmButton();
+  });
+
+  function resetArmButton() {
+    clearTimeout(confirmTimer);
+    const specToggle = $('spec-toggle');
+    if (specToggle) specToggle.disabled = running || courses.includes('crab-meadow');
+    const b = $('arm');
+    if (running) { b.textContent = 'Disarm'; b.className = 'armbtn disarm'; b.disabled = false; return; }
+    b.textContent = MODE_LABEL[mode] + (target === 'oregon' ? ' on GCP VM' : target === 'aws' ? ' on AWS' : '');
+    b.className = 'armbtn'; b.disabled = false;
+  }
+
+  // ── arm / disarm with real-money confirm ──
+  $('arm').addEventListener('click', async () => {
+    armAlerts(); // user gesture: unlock the chime + ask for notification permission
+    const b = $('arm');
+    if (running) { await fetch('/api/disarm', { method: 'POST' }); return; }
+    const headlessLive = mode === 'live' && (target !== 'mac' || host === 'vm');
+    if (headlessLive && !cardOk) {
+      alert('A headless run books fully automatically and needs the card: fill FEE_CARD_* in .env' + (host === 'vm' ? '.' : ', then sync it to the box.'));
+      return;
+    }
+    if (mode === 'live' && !b.classList.contains('confirm')) {
+      b.textContent = headlessLive ? `Click again — ${target === 'aws' ? 'AWS box' : 'VM'} books + charges $${5 * players} itself` : 'Click again — this books for real';
+      b.classList.add('confirm');
+      confirmTimer = setTimeout(resetArmButton, 6000);
+      return;
+    }
+    clearTimeout(confirmTimer);
+    b.disabled = true;
+    const r = await fetch('/api/arm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, courses, target, players, date: pickedDate(), spec }) }).then((r) => r.json());
+    if (!r.ok) { alert(r.error); resetArmButton(); }
+  });
+
+  // ── auto-arm schedule ──
+  function renderSchedule(s) {
+    const box = $('sched');
+    if (s) {
+      const atD = new Date(s.at);
+      const sameDay = atD.toDateString() === new Date().toDateString();
+      const t = (sameDay ? '' : atD.toLocaleDateString('en-US', { weekday: 'short' }) + ' ') + atD.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+      box.innerHTML = `<span class="set">auto-arm set: ${MODE_LABEL[s.mode].replace('Arm ', '').replace('Run ', '')} at ${t}${s.courses ? ' · ' + s.courses.join('+') : ''}${s.spec ? ' · SPEC' : ' · detect-first'}${s.target === 'oregon' ? ' · on GCP VM' : s.target === 'aws' ? ' · on AWS' : ''}</span> <button class="cancel" id="sched-cancel">Cancel</button>`;
+      $('schednote').style.display = '';
+      $('sched-cancel').onclick = async () => { await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cancel: true }) }); };
+    } else {
+      box.innerHTML = `<span>or auto-arm</span> <select id="sched-day"><option value="today">today</option><option value="tomorrow">tomorrow</option></select> <span>at</span> <input type="time" id="sched-time" value="18:50"> <button id="sched-btn">Set</button>`;
+      $('schednote').style.display = 'none';
+      bindSchedBtn();
+    }
+  }
+  function bindSchedBtn() {
+    $('sched-btn').onclick = async () => {
+      const r = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, time: $('sched-time').value, day: $('sched-day')?.value ?? 'today', courses, target, players, date: pickedDate(), spec }) }).then((r) => r.json());
+      if (!r.ok) alert(r.error);
+    };
+  }
+  bindSchedBtn();
+
+  // ── countdown to next 7:00pm ──
+  function nextDrop() {
+    const n = new Date(); const d = new Date(n);
+    d.setHours(19, 0, 0, 0);
+    if (d <= n) d.setDate(d.getDate() + 1);
+    return d;
+  }
+  function tickClock() {
+    if (document.querySelector('.verdict')) return; // verdict owns the panel
+    const ms = nextDrop() - new Date();
+    const h = String(Math.floor(ms / 3.6e6)).padStart(2, '0');
+    const m = String(Math.floor(ms % 3.6e6 / 6e4)).padStart(2, '0');
+    const s = String(Math.floor(ms % 6e4 / 1e3)).padStart(2, '0');
+    const el = $('clock');
+    if (el) { el.innerHTML = `<span class="dim">T−</span>${h}:${m}:${s}`; el.classList.toggle('armed', running); }
+  }
+  setInterval(tickClock, 250);
+
+  // ── phase dot ──
+  function setDot(cls, label) { $('dot').className = 'phase-dot ' + cls; $('dot-label').textContent = label; }
+  const PHASE_DOT = {
+    idle: ['on-idle', 'standing by'], bootstrap: ['on-run', 'starting up'], ready: ['on-run', 'armed · systems ready'],
+    waiting: ['on-run', 'armed · waiting for drop'], racing: ['on-run', 'RACING'], held: ['on-run', 'slot held'],
+    booking: ['on-run', 'booking'], ready_click: ['on-run', 'one click left'], booked: ['on-good', 'booked'], test_passed: ['on-good', 'passed'],
+    failed: ['on-bad', 'did not book'], manual: ['on-bad', 'needs you'],
+  };
+
+  // ── console ──
+  function pushLine(line) {
+    const c = $('console');
+    if (c.dataset.fresh !== '1') { c.textContent = ''; c.dataset.fresh = '1'; }
+    const div = document.createElement('div');
+    div.textContent = line;
+    if (line.includes('✗') || line.includes('⚠')) div.className = 'ln-err';
+    else if (line.includes('✓') || line.includes('BOOKED')) div.className = 'ln-ok';
+    div.classList.add('ln');
+    c.appendChild(div);
+    while (c.children.length > 400) c.removeChild(c.firstChild);
+    c.scrollTop = c.scrollHeight;
+  }
+
+  // ── stage body states ──
+  function showClock(statusText) {
+    $('stage-body').innerHTML = `
+      <div class="bigclock" id="clock">--:--:--</div>
+      <div class="clock-label" id="clock-label">until tonight’s 7:00pm drop</div>
+      <div class="statusline" id="statusline"></div>`;
+    $('statusline').textContent = statusText;
+    tickClock();
+  }
+  function showVerdict(v) {
+    const proofable = ['booked', 'ready_click', 'manual'].includes(v.kind);
+    const links = proofable
+      ? `<div class="links" id="proof">${v.kind === 'booked' ? '' : 'Watching your inbox for ForeUp’s confirmation email — this panel flips to BOOKED ✓ the moment it lands. '}Check for yourself: <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a> · <a href="https://mail.google.com/mail/u/0/#search/from%3Aforeup" target="_blank" rel="noopener">Gmail</a></div>` : '';
+    $('stage-body').innerHTML = `
+      <div class="verdict v-${v.kind}">
+        <h3>${v.title}</h3>
+        <p></p>
+        ${links}
+        <div class="links"><a href="/api/capture" download>⬇ Download this run to share</a></div>
+      </div>`;
+    document.querySelector('.verdict p').textContent = v.detail;
+  }
+
+  // ── make the result impossible to miss: tab title, favicon, notification, chime ──
+  function setFav(emoji) {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d'); x.font = '54px serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(emoji, 32, 38);
+    let l = document.querySelector('link[rel=icon]');
+    if (!l) { l = document.createElement('link'); l.rel = 'icon'; document.head.appendChild(l); }
+    l.href = c.toDataURL();
+  }
+  setFav('⛳');
+  let audioCtx = null;
+  function armAlerts() { // must run inside a user gesture
+    if (!audioCtx) try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+  }
+  function chime(good) {
+    if (!audioCtx) return;
+    const notes = good ? [523, 659, 784, 1047] : [330, 262];
+    notes.forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.type = 'sine'; o.connect(g); g.connect(audioCtx.destination);
+      const t = audioCtx.currentTime + i * 0.16;
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.03); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      o.start(t); o.stop(t + 0.55);
+    });
+  }
+  function notify(title, body) {
+    if ('Notification' in window && Notification.permission === 'granted') try { new Notification(title, { body }); } catch {}
+  }
+  function announceVerdict(v) {
+    const good = v.kind === 'booked' || v.kind === 'test_passed';
+    const attention = v.kind === 'ready_click' || v.kind === 'manual';
+    document.title = `${good ? '✅' : attention ? '🟠' : '❌'} ${v.title} — Turbo Sniper`;
+    setFav(good ? '✅' : attention ? '🟠' : '❌');
+    chime(good || attention);
+    notify(`${v.title}`, v.detail.slice(0, 120));
+  }
+
+  // ── SSE ──
+  function connect() {
+    const es = new EventSource('/api/stream');
+    es.addEventListener('hello', (e) => {
+      const s = JSON.parse(e.data);
+      running = s.running; resetArmButton();
+      const [cls, lbl] = PHASE_DOT[s.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      if (s.verdict) showVerdict(s.verdict);
+      else if (s.statusText && s.running) { showClock(s.statusText); }
+      (s.lines ?? []).forEach(pushLine);
+    });
+    es.addEventListener('armed', () => { running = true; resetArmButton(); showClock('Starting…'); });
+    es.addEventListener('line', (e) => {
+      const d = JSON.parse(e.data);
+      pushLine(d.line);
+      const [cls, lbl] = PHASE_DOT[d.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      const sl = $('statusline'); if (sl) sl.textContent = d.statusText;
+    });
+    es.addEventListener('verdict', (e) => {
+      const d = JSON.parse(e.data);
+      running = false; resetArmButton();
+      const [cls, lbl] = PHASE_DOT[d.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      showVerdict(d.verdict);
+      announceVerdict(d.verdict);
+      loadHistory();
+    });
+    es.addEventListener('proof', (e) => {
+      const d = JSON.parse(e.data);
+      const p = $('proof');
+      if (!p) return;
+      if (d.emailFound) p.innerHTML = `✅ Confirmation email received at ${d.at}: “${d.subject}” · <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a>`;
+      else p.innerHTML = `⚠️ No confirmation email after 12 min. If you clicked PROCESS TRANSACTION, verify on <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a>; if you didn’t, the hold expired at $0.`;
+    });
+    es.addEventListener('schedule', (e) => renderSchedule(JSON.parse(e.data).schedule));
+    es.addEventListener('sync', () => {
+      const b = $('sync-btn'); b.disabled = false; b.textContent = 'Sync → GCP VM';
+      const a = $('sync-aws-btn'); a.disabled = false; a.textContent = 'Sync → AWS box';
+      pollVm(); pollAws();
+    });
+    es.onerror = () => { es.close(); setTimeout(connect, 2000); };
+  }
+  connect();
+
+  // ── config + history ──
+  fetch('/api/state').then((r) => r.json()).then((s) => {
+    host = s.host ?? 'mac';
+    applyCard(s.card);
+    applyHost();
+    const c = s.config ?? {};
+    courses = (c.COURSE ?? 'red,green').split(',').map((x) => x.trim()).filter(Boolean);
+    renderCourses();
+    $('cfg-window').textContent = `${c.WINDOW_START ?? '6:30'}–${c.WINDOW_END ?? '8:30'}am · ${c.SLOT_ORDER ?? 'latest'} first · fallback to ${c.FALLBACK_UNTIL ?? '8:30'}`;
+    players = Math.min(4, Math.max(1, parseInt(c.PLAYERS ?? '4', 10) || 4));
+    cfgHoles = c.HOLES ?? '18';
+    renderPlayers();
+    const td = (c.TARGET_DATE ?? '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    $('date-pick').value = td ? `${td[3]}-${td[1]}-${td[2]}` : isoPlusDays(7);
+    renderDateNote();
+    if (s.schedule) renderSchedule(s.schedule);
+  });
+
+  function loadHistory() {
+    fetch('/api/history').then((r) => r.json()).then(({ runs, stats }) => {
+      const statsEl = document.querySelector('.histstats');
+      if (statsEl) statsEl.remove();
+      if (stats) {
+        const p = document.createElement('p');
+        p.className = 'histstats';
+        p.innerHTML = `<b>${stats.drops}</b> live drop${stats.drops > 1 ? 's' : ''} recorded · median detection <b>+${stats.medianDetectMs}ms</b> after poll-fire (the sniper auto-widens its head start if drops land early)`;
+        document.querySelector('.history .wrap').before(p);
+      }
+      if (!runs.length) return;
+      // Idle console shows the last run's receipt instead of sitting empty.
+      const c = $('console');
+      if (c.dataset.fresh !== '1' && runs[0]) {
+        const r = runs[0];
+        const [label] = RESULTS[r.result] ?? [r.result.toUpperCase()];
+        c.innerHTML = '';
+        [`last run · ${new Date(r.runAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
+         `  result:   ${label}`,
+         r.heldTime ? `  slot:     ${(r.heldTime.split(' ')[1] ?? '')} ${r.heldCourse ?? ''}` : null,
+         r.detectMs != null ? `  detect:   +${r.detectMs}ms after the drop` : null,
+         `  flags:    ${r.args || '(defaults)'}`,
+         '', 'arm a run to stream live from here.'].filter((x) => x !== null).forEach((t) => {
+          const div = document.createElement('div'); div.className = 'ln-dim'; div.textContent = t; c.appendChild(div);
+        });
+      }
+      const rows = runs.map((r) => {
+        const [label, cls] = RESULTS[r.result] ?? [r.result.toUpperCase(), 'r-mid'];
+        const when = new Date(r.runAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const slot = r.heldTime ? `${(r.heldTime.split(' ')[1] ?? '')} ${r.heldCourse ?? ''}` : '—';
+        return `<tr>
+          <td>${when}</td>
+          <td class="${cls}">${label}</td>
+          <td>${slot}</td>
+          <td>${r.detectMs != null ? r.detectMs + 'ms' : '—'}</td>
+          <td>${r.avgPollRtt != null ? r.avgPollRtt + 'ms' : '—'}</td>
+          <td>${r.totalMs != null ? (r.totalMs / 1000).toFixed(2) + 's' : '—'}</td>
+          <td>${r.args || '(defaults)'}</td>
+        </tr>`;
+      }).join('');
+      $('history').innerHTML = `<table>
+        <thead><tr><th>Ran</th><th>Result</th><th>Slot held</th><th>Detect</th><th>Poll RTT</th><th>Total</th><th>Flags</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    });
+  }
+  loadHistory();
+})();
+</script>
+</body>
+</html>

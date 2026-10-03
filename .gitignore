@@ -1,0 +1,33 @@
+# Dependencies / build
+node_modules/
+dist/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.aws/
+credentials
+*credentials*.json
+config.py
+secrets.*
+
+# Session cookies / auth state
+auth/
+
+# Run artifacts (contain account + reservation data)
+logs/
+*.log
+*.jsonl
+
+# OS
+.DS_Store

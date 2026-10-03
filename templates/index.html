@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bethpage Sniper</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>BETHPAGE SNIPER</h1>
+            <p>Precision tee time booking for Bethpage State Park</p>
+        </header>
+
+        <div class="dashboard">
+            <!-- Countdown Section -->
+            <div class="card countdown-section" id="countdown-card">
+                <div class="countdown-display">
+                    <div class="countdown-label">Time Until Release</div>
+                    <div class="countdown-time" id="countdown">--:--:--</div>
+                    <div class="countdown-date" id="target-date">Loading...</div>
+                </div>
+                <div style="text-align: center; margin-top: 20px;">
+                    <button class="btn btn-primary" id="arm-btn" onclick="armSniper()">
+                        ARM SNIPER
+                    </button>
+                    <button class="btn btn-danger" id="abort-btn" onclick="abortSniper()" style="display: none;">
+                        ABORT
+                    </button>
+                </div>
+                <div class="progress-bar" style="display: none;" id="progress-bar">
+                    <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <!-- Status Section -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="icon">📡</span>
+                        Status
+                    </div>
+                    <span class="status-badge" id="main-status">Ready</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Browser</span>
+                    <span class="status-value">
+                        <span class="status-dot" id="browser-dot"></span>
+                        <span id="browser-status">Not started</span>
+                    </span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Login</span>
+                    <span class="status-value">
+                        <span class="status-dot" id="login-dot"></span>
+                        <span id="login-status">Not logged in</span>
+                    </span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Gmail Monitor</span>
+                    <span class="status-value">
+                        <span class="status-dot" id="gmail-dot"></span>
+                        <span id="gmail-status">Not connected</span>
+                    </span>
+                </div>
+                <div class="status-row">
+                    <span class="status-label">Target Date</span>
+                    <span class="status-value" id="booking-date">--</span>
+                </div>
+            </div>
+
+            <!-- Preferences Section -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="icon">⛳</span>
+                        Preferences
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Target Date</label>
+                    <input type="date" id="target-date-picker" />
+                    <p style="color: var(--text-secondary); font-size: 0.8rem; margin-top: 5px;">
+                        Default: 7 days from today (when new times release)
+                    </p>
+                </div>
+                <div class="form-group">
+                    <label>Preferred Times (click to select)</label>
+                    <div class="time-chips" id="time-chips">
+                        <!-- Filled by JS -->
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Players</label>
+                    <select id="players-select">
+                        <option value="1">1 Player</option>
+                        <option value="2">2 Players</option>
+                        <option value="3">3 Players</option>
+                        <option value="4" selected>4 Players</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Holes</label>
+                    <select id="holes-select">
+                        <option value="18" selected>18 Holes</option>
+                        <option value="9">9 Holes</option>
+                        <option value="both">Both</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Courses Section -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="icon">🏌️</span>
+                        Courses
+                    </div>
+                </div>
+                <div class="course-list">
+                    <label class="course-item">
+                        <input type="checkbox" name="course" value="Black" checked>
+                        <span class="course-name">Black</span>
+                        <span class="course-difficulty">Championship</span>
+                    </label>
+                    <label class="course-item">
+                        <input type="checkbox" name="course" value="Red" checked>
+                        <span class="course-name">Red</span>
+                        <span class="course-difficulty">Challenging</span>
+                    </label>
+                    <label class="course-item">
+                        <input type="checkbox" name="course" value="Blue" checked>
+                        <span class="course-name">Blue</span>
+                        <span class="course-difficulty">Moderate</span>
+                    </label>
+                    <label class="course-item">
+                        <input type="checkbox" name="course" value="Green">
+                        <span class="course-name">Green</span>
+                        <span class="course-difficulty">Easier</span>
+                    </label>
+                    <label class="course-item">
+                        <input type="checkbox" name="course" value="Yellow">
+                        <span class="course-name">Yellow</span>
+                        <span class="course-difficulty">Executive</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Email Code Section -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="icon">📧</span>
+                        Verification Code
+                    </div>
+                    <span class="status-badge" id="code-status">Waiting</span>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 15px; font-size: 0.9rem;">
+                    Code will be auto-fetched from Gmail, or enter manually below:
+                </p>
+                <div class="code-input-section">
+                    <input type="text" id="verification-code" placeholder="000000" maxlength="6">
+                    <button class="btn btn-secondary" onclick="submitCode()">Submit</button>
+                </div>
+                <div id="code-message" style="margin-top: 10px; font-size: 0.85rem; color: var(--text-secondary);"></div>
+            </div>
+
+            <!-- Log Section -->
+            <div class="card" style="grid-column: 1 / -1;">
+                <div class="card-header">
+                    <div class="card-title">
+                        <span class="icon">📋</span>
+                        Activity Log
+                    </div>
+                    <button class="btn btn-secondary" onclick="clearLog()" style="padding: 8px 16px; font-size: 0.8rem;">
+                        Clear
+                    </button>
+                </div>
+                <div class="log-container" id="log-container">
+                    <div class="log-entry">
+                        <span class="log-time">--:--:--</span>
+                        <span class="log-message">Sniper ready. Configure your preferences and click ARM SNIPER when ready.</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let armed = false;
+        let sniperRunning = false;
+        let eventSource = null;
+        const selectedTimes = new Set(['9am-10am', '10am-11am']);
+
+        // Time ranges instead of exact times (more practical for Bethpage)
+        const availableTimes = [
+            '6am-7am', '7am-8am', '8am-9am', '9am-10am', '10am-11am', '11am-12pm',
+            '12pm-1pm', '1pm-2pm', '2pm-3pm', '3pm-4pm', '4pm-5pm'
+        ];
+
+        // Initialize time chips
+        function initTimeChips() {
+            const container = document.getElementById('time-chips');
+            container.innerHTML = availableTimes.map(time => `
+                <div class="time-chip ${selectedTimes.has(time) ? 'selected' : ''}"
+                     onclick="toggleTime('${time}', this)">
+                    ${time}
+                </div>
+            `).join('');
+        }
+
+        function toggleTime(time, element) {
+            if (selectedTimes.has(time)) {
+                selectedTimes.delete(time);
+                element.classList.remove('selected');
+            } else {
+                selectedTimes.add(time);
+                element.classList.add('selected');
+            }
+        }
+
+        // Countdown
+        function updateCountdown() {
+            const now = new Date();
+            let target = new Date();
+            target.setHours(19, 0, 0, 0); // 7:00 PM
+
+            if (now >= target) {
+                target.setDate(target.getDate() + 1);
+            }
+
+            const diff = target - now;
+            const hours = Math.floor(diff / (1000 * 60 * 60));
+            const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+            const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+            const ms = Math.floor((diff % 1000) / 10);
+
+            const countdownEl = document.getElementById('countdown');
+
+            if (armed && diff < 60000) {
+                // Final minute - show milliseconds
+                countdownEl.textContent = `${seconds.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+                countdownEl.classList.add('urgent');
+            } else if (armed && diff < 300000) {
+                // Final 5 minutes
+                countdownEl.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                countdownEl.classList.add('urgent');
+            } else {
+                countdownEl.textContent = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                countdownEl.classList.remove('urgent');
+            }
+
+            // Update target date
+            const bookingDate = new Date();
+            bookingDate.setDate(bookingDate.getDate() + 7);
+            document.getElementById('target-date').textContent =
+                `Booking for ${bookingDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}`;
+            document.getElementById('booking-date').textContent =
+                bookingDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        }
+
+        // Logging
+        function addLog(message, level = 'info') {
+            const container = document.getElementById('log-container');
+            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${level}`;
+            entry.innerHTML = `
+                <span class="log-time">${time}</span>
+                <span class="log-message">${message}</span>
+            `;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function clearLog() {
+            document.getElementById('log-container').innerHTML = '';
+            addLog('Log cleared');
+        }
+
+        // Status updates
+        function setStatus(element, status, dot = null) {
+            document.getElementById(element).textContent = status;
+            if (dot) {
+                const dotEl = document.getElementById(dot);
+                dotEl.className = 'status-dot ' + (status.includes('Connected') || status.includes('Logged') || status.includes('Ready') ? 'online' : '');
+            }
+        }
+
+        // Arm the sniper
+        async function armSniper() {
+            if (armed) return;
+
+            const times = Array.from(selectedTimes);
+            const courses = Array.from(document.querySelectorAll('input[name="course"]:checked')).map(c => c.value);
+            const players = document.getElementById('players-select').value;
+            const holes = document.getElementById('holes-select').value;
+            const targetDate = document.getElementById('target-date-picker').value;
+
+            if (times.length === 0) {
+                addLog('Please select at least one preferred time', 'error');
+                return;
+            }
+
+            addLog('Arming sniper...', 'warn');
+            addLog(`Target date: ${targetDate}, Players: ${players}, Holes: ${holes}`);
+            document.getElementById('arm-btn').style.display = 'none';
+            document.getElementById('abort-btn').style.display = 'inline-flex';
+            document.getElementById('countdown-card').classList.add('armed');
+            document.getElementById('main-status').textContent = 'Armed';
+            document.getElementById('main-status').className = 'status-badge active';
+
+            // Connect to SSE
+            eventSource = new EventSource(`/api/arm?times=${encodeURIComponent(JSON.stringify(times))}&courses=${encodeURIComponent(JSON.stringify(courses))}&players=${players}&holes=${holes}&date=${targetDate}`);
+
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.log) {
+                    addLog(data.log, data.level || 'info');
+                }
+
+                if (data.status) {
+                    if (data.status.browser) setStatus('browser-status', data.status.browser, 'browser-dot');
+                    if (data.status.login) setStatus('login-status', data.status.login, 'login-dot');
+                    if (data.status.gmail) setStatus('gmail-status', data.status.gmail, 'gmail-dot');
+                }
+
+                if (data.code_found) {
+                    document.getElementById('verification-code').value = data.code_found;
+                    document.getElementById('code-status').textContent = 'Found!';
+                    document.getElementById('code-status').className = 'status-badge ready';
+                    document.getElementById('code-message').textContent = `Auto-detected: ${data.code_found}`;
+                    addLog(`Verification code auto-detected: ${data.code_found}`, 'success');
+                }
+
+                if (data.firing) {
+                    document.getElementById('countdown-card').classList.add('firing');
+                    document.getElementById('main-status').textContent = 'FIRING';
+                }
+
+                if (data.complete) {
+                    armed = false;
+                    eventSource.close();
+                    document.getElementById('countdown-card').classList.remove('armed', 'firing');
+                    document.getElementById('arm-btn').style.display = 'inline-flex';
+                    document.getElementById('abort-btn').style.display = 'none';
+
+                    if (data.success) {
+                        document.getElementById('main-status').textContent = 'SUCCESS!';
+                        document.getElementById('main-status').className = 'status-badge ready';
+                        addLog('TEE TIME BOOKED!', 'success');
+                    } else {
+                        document.getElementById('main-status').textContent = 'Complete';
+                        document.getElementById('main-status').className = 'status-badge';
+                    }
+                }
+            };
+
+            eventSource.onerror = () => {
+                addLog('Connection error - check terminal for details', 'error');
+            };
+
+            armed = true;
+        }
+
+        function abortSniper() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            fetch('/api/abort', { method: 'POST' });
+
+            armed = false;
+            document.getElementById('countdown-card').classList.remove('armed', 'firing');
+            document.getElementById('arm-btn').style.display = 'inline-flex';
+            document.getElementById('abort-btn').style.display = 'none';
+            document.getElementById('main-status').textContent = 'Aborted';
+            document.getElementById('main-status').className = 'status-badge error';
+            addLog('Sniper aborted', 'warn');
+        }
+
+        function submitCode() {
+            const code = document.getElementById('verification-code').value;
+            if (code) {
+                fetch('/api/submit-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                addLog(`Submitting code: ${code}`);
+            }
+        }
+
+        // Poll for Gmail codes
+        async function checkGmail() {
+            try {
+                const response = await fetch('/api/check-gmail');
+                const data = await response.json();
+                if (data.code) {
+                    document.getElementById('verification-code').value = data.code;
+                    document.getElementById('code-status').textContent = 'Found!';
+                    document.getElementById('code-status').className = 'status-badge ready';
+                }
+            } catch (e) {}
+        }
+
+        // Initialize date picker with default 7 days from now
+        function initDatePicker() {
+            const datePicker = document.getElementById('target-date-picker');
+            const defaultDate = new Date();
+            defaultDate.setDate(defaultDate.getDate() + 7);
+            datePicker.value = defaultDate.toISOString().split('T')[0];
+
+            // Update display when date changes
+            datePicker.addEventListener('change', updateDateDisplay);
+            updateDateDisplay();
+        }
+
+        function updateDateDisplay() {
+            const datePicker = document.getElementById('target-date-picker');
+            const selectedDate = new Date(datePicker.value + 'T12:00:00');
+            document.getElementById('target-date').textContent =
+                `Booking for ${selectedDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}`;
+            document.getElementById('booking-date').textContent =
+                selectedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        }
+
+        // Initialize
+        initTimeChips();
+        initDatePicker();
+        updateCountdown();
+        setInterval(updateCountdown, 100);
+
+        // Check Gmail periodically when armed
+        setInterval(() => {
+            if (armed) checkGmail();
+        }, 3000);
+    </script>
+</body>
+</html>

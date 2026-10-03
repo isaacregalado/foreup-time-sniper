@@ -1,0 +1,32 @@
+{
+  "name": "bethpage-sniper",
+  "version": "1.0.0",
+  "description": "Bethpage tee time sniper \u2014 fast booking at the 7PM drop",
+  "scripts": {
+    "turbo": "tsx src/turbo.ts",
+    "turbo:dry": "tsx src/turbo.ts --dry-run",
+    "turbo:hold-only": "tsx src/turbo.ts --no-book",
+    "snipe": "tsx src/api-sniper.ts",
+    "snipe:slow": "tsx src/index.ts",
+    "dry-run": "tsx src/api-sniper.ts --dry-run",
+    "dry-run:slow": "tsx src/index.ts --dry-run",
+    "test-email": "tsx src/test-email.ts",
+    "test": "tsx src/tests.ts",
+    "typecheck": "tsc --noEmit",
+    "setup": "npx playwright install chromium && echo '\u2713 Browser installed'",
+    "ui": "tsx src/ui-server.ts",
+    "capture": "tsx scripts/capture-run.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "imapflow": "^1.2.18",
+    "mailparser": "^3.9.6",
+    "playwright": "^1.50.1"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

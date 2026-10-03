@@ -1,0 +1,16 @@
+[Unit]
+Description=Bethpage Turbo Sniper — Sunday 7PM ET tee-time drop
+After=network-online.target ntp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=isaac
+WorkingDirectory=/home/isaac/bethpage-sniper
+Environment="HEADLESS=1"
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/npm run turbo
+StandardOutput=append:/home/isaac/bethpage-sniper/logs/snipe.log
+StandardError=append:/home/isaac/bethpage-sniper/logs/snipe.log
+TimeoutStartSec=300
+Restart=no

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Bethpage Turbo Sniper every Sunday at 18:55 ET (5min before drop)
+
+[Timer]
+# 18:55 in America/New_York → handles EST/EDT automatically.
+# 5-minute lead lets the script log in, NTP-sync, IMAP-connect before T=0.
+OnCalendar=Sun *-*-* 18:55:00 America/New_York
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
