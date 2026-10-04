@@ -19,6 +19,7 @@ import { armTimerCmd, attachCmd, cancelTimerCmd } from './remote-arm';
 const PORT = 4747;
 const ROOT = path.join(__dirname, '..');
 const HTML_PATH = path.join(ROOT, 'static', 'turbo-ui.html');
+const HTML_NEXT_PATH = path.join(ROOT, 'static', 'turbo-ui-next.html'); // redesign preview, served at /next
 const LOG_PATH = path.join(ROOT, 'logs', 'race-log.jsonl');
 
 // ────────────────────────────────────────────────────────────
@@ -831,6 +832,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(fs.readFileSync(HTML_PATH));
+  } else if (req.method === 'GET' && url === '/next' && fs.existsSync(HTML_NEXT_PATH)) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(fs.readFileSync(HTML_NEXT_PATH));
   } else if (req.method === 'GET' && url === '/api/state') {
     json(res, 200, { ...state, host: IS_MAC ? 'mac' : 'vm', config: readConfig(), cardReady: cardReady(), card: cardStatus(), schedule: publicSchedule() });
   } else if (req.method === 'GET' && url === '/api/vm') {

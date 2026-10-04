@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bethpage Sniper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=League+Gothic&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* The place supplies the palette: scorecard stock, printed green ink, a
+     leaderboard-green board with white number plates, and the tee-marker
+     colors Bethpage's courses are named after. */
+  :root {
+    color-scheme: light dark;
+    --paper: #F3F5EF;
+    --sheet: #FFFFFF;
+    --ink: #14211A;
+    --pencil: #5C6A61;
+    --rule: #D5DBD0;
+    --board: #0F2A1E;
+    --board-edge: rgba(244, 241, 230, .30);
+    --plate: #F4F1E6;
+    --plate-ink: #14211A;
+    --fairway: #1E7A4C;
+    --flag: #C6352B;
+    --brass: #8A5F12;
+    --brass-bright: #E0A93B;
+    --on-brass: #221803;
+    --c-black: #16181A; --c-black-ring: #16181A;
+    --c-red: #C6352B; --c-green: #1E7A4C; --c-crab: #7A5C3E;
+    --console: #0B1611; --console-ink: #DCE6DE;
+    --gutter: clamp(16px, 4vw, 40px);
+    --display: "League Gothic", "Avenir Next Condensed", "Arial Narrow", sans-serif;
+    --text: "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0B1410;
+      --sheet: #13221A;
+      --ink: #ECF0E8;
+      --pencil: #96A69B;
+      --rule: #27392F;
+      --board: #12301F;
+      --board-edge: rgba(244, 241, 230, .34);
+      --fairway: #55C389;
+      --flag: #F0705F;
+      --brass: #F0BC55;
+      --c-black: #050706; --c-black-ring: #C9D1CB;
+      --c-red: #E2513F; --c-green: #3FA56D; --c-crab: #B08A63;
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { background: var(--paper); }
+  body {
+    min-height: 100vh; color: var(--ink); background: var(--paper);
+    font: 400 15px/1.5 var(--text);
+    padding: 28px var(--gutter) 72px;
+  }
+  .page { max-width: 1180px; margin: 0 auto; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  a { color: var(--fairway); }
+  :focus-visible { outline: 2.5px solid var(--brass-bright); outline-offset: 2px; }
+
+  /* ── top ─────────────────────────────────── */
+  .top { display: flex; align-items: baseline; gap: 6px 22px; flex-wrap: wrap; margin-bottom: 22px; }
+  .top h1 { font: 400 46px/1 var(--display); letter-spacing: .01em; display: flex; align-items: center; gap: 12px; }
+  /* The two courses this is for, as their tee markers. */
+  .mark { position: relative; width: 38px; height: 22px; flex: none; }
+  .mark i { position: absolute; top: 0; width: 22px; height: 22px; border-radius: 50%; }
+  .mark i:first-child { left: 0; background: var(--c-black); box-shadow: 0 0 0 1.5px var(--c-black-ring); }
+  .mark i:last-child { left: 16px; background: var(--c-red); box-shadow: 0 0 0 2.5px var(--paper); }
+  .top .sub { color: var(--pencil); font-size: 17px; }
+
+  /* ── layout ──────────────────────────────── */
+  .grid {
+    display: grid; gap: 20px 28px; align-items: start;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+    grid-template-rows: auto auto 1fr auto;
+    grid-template-areas: "board plan" "go plan" "auto plan" "latest latest";
+  }
+  .board { grid-area: board; }
+  .plan { grid-area: plan; }
+  .go { grid-area: go; }
+  .auto { grid-area: auto; }
+  .latest { grid-area: latest; margin-top: 14px; }
+  /* While a run is going the plan is locked, so the live log takes its place. */
+  body.is-running .plan { display: none; }
+  body.is-running .latest { grid-area: plan; margin-top: 0; }
+  /* A set auto-arm is the plan of record, so it sits right under the board. */
+  body.has-sched:not(.is-running) .grid { grid-template-areas: "board plan" "auto plan" "go plan" "latest latest"; }
+
+  /* ── the board: the one loud thing ───────── */
+  .board {
+    container-type: inline-size;
+    background: var(--board); color: var(--plate);
+    border-radius: 14px; padding: 24px 26px 26px;
+    /* a painted board with a pinstripe frame */
+    box-shadow: inset 0 0 0 7px var(--board), inset 0 0 0 8px var(--board-edge);
+  }
+  .board-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 14px; }
+  .board-title { font: 400 clamp(20px, 6.2cqw, 28px)/1 var(--display); letter-spacing: .07em; text-transform: uppercase; opacity: .92; }
+  .lamp { display: inline-flex; align-items: center; gap: 8px; font: 600 13px/1 var(--text); white-space: nowrap; }
+  .lamp i { width: 10px; height: 10px; border-radius: 50%; background: rgba(244, 241, 230, .4); }
+  .lamp.on-run i { background: var(--brass-bright); animation: pulse 1.2s infinite; }
+  .lamp.on-good i { background: #7BE0A5; }
+  .lamp.on-bad i { background: #FF8A76; }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  .clock { display: flex; align-items: flex-start; gap: 1.4cqw; }
+  .grp { display: flex; flex-direction: column; align-items: center; gap: 7px; }
+  .plates { display: flex; gap: 1cqw; }
+  .pl {
+    display: inline-grid; place-items: center;
+    width: clamp(34px, 13.4cqw, 92px); height: clamp(48px, 19cqw, 130px);
+    background: var(--plate); color: var(--plate-ink); border-radius: 5px;
+    font: 400 clamp(44px, 17.6cqw, 121px)/1 var(--display);
+    padding-top: .06em; /* League Gothic sits high in its box */
+    box-shadow: inset 0 -3px 0 rgba(0, 0, 0, .13), 0 2px 0 rgba(0, 0, 0, .35);
+    transition: background-color .3s ease;
+  }
+  .clock.armed .pl { background: var(--brass-bright); }
+  .grp small { font: 500 12.5px/1 var(--text); opacity: .7; }
+  .sep { align-self: flex-start; height: clamp(48px, 19cqw, 130px); width: 2.6cqw; position: relative; }
+  .sep::before, .sep::after { content: ""; position: absolute; left: 50%; width: clamp(5px, 1.6cqw, 10px); aspect-ratio: 1; border-radius: 50%; background: var(--plate); opacity: .8; transform: translateX(-50%); }
+  .sep::before { top: 32%; }
+  .sep::after { top: 60%; }
+  .statusline { margin-top: 18px; font: 600 18px/1.4 var(--text); max-width: 46ch; }
+
+  .verdict h2 { font: 400 clamp(54px, 19cqw, 116px)/.9 var(--display); letter-spacing: .02em; text-transform: uppercase; }
+  .verdict.v-booked h2, .verdict.v-test_passed h2 { color: #7BE0A5; }
+  .verdict.v-failed h2 { color: #FF8A76; }
+  .verdict.v-manual h2, .verdict.v-ready_click h2 { color: #F2C25B; }
+  .verdict.v-ready_click h2 { animation: readypulse 1.4s ease-in-out infinite; }
+  @keyframes readypulse { 50% { opacity: .6; } }
+  .verdict p { margin-top: 14px; font-size: 16px; line-height: 1.5; max-width: 52ch; }
+  .verdict .links { margin-top: 12px; font-size: 14px; opacity: .92; }
+  .verdict a { color: var(--plate); }
+  .verdict .back { margin-top: 16px; padding: 8px 14px; border-radius: 8px; border: 1.5px solid rgba(244, 241, 230, .45); background: transparent; color: var(--plate); font: 600 14px var(--text); }
+  .verdict .back:hover { border-color: var(--plate); }
+
+  /* ── arm ─────────────────────────────────── */
+  .plan-line { font: 500 16px/1.45 var(--text); margin-bottom: 12px; }
+  .plan-line:empty { display: none; }
+  .armbtn {
+    width: 100%; min-height: 58px; padding: 14px 18px; border: 0; border-radius: 12px;
+    background: var(--brass-bright); color: var(--on-brass);
+    font: 700 18px/1.2 var(--text);
+    transition: filter .12s ease;
+  }
+  .armbtn:hover { filter: brightness(1.06); }
+  .armbtn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+  .armbtn.confirm { background: var(--flag); color: #fff; }
+  .armbtn.disarm { background: transparent; color: var(--flag); box-shadow: inset 0 0 0 2px var(--flag); }
+  .armnote { font-size: 13.5px; color: var(--pencil); margin-top: 9px; }
+
+  .sched { padding-top: 18px; border-top: 1px solid var(--rule); display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; font-size: 15px; }
+  body.has-sched .sched { padding-top: 0; border-top: 0; }
+  .sched-lbl { flex: 1 1 100%; font-weight: 600; }
+  .sched select, .sched input[type=time] { background: var(--sheet); border: 1.5px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-weight: 600; }
+  .quiet { padding: 8px 14px; border-radius: 8px; border: 1.5px solid var(--ink); background: transparent; font: 600 14.5px var(--text); }
+  .quiet:hover { background: var(--ink); color: var(--paper); }
+  .quiet:disabled { opacity: .5; }
+  .sched-set { flex: 1 1 100%; border-left: 4px solid var(--brass-bright); background: color-mix(in srgb, var(--brass-bright) 14%, var(--sheet)); border-radius: 0 8px 8px 0; padding: 12px 14px; }
+  .sched-set b { font-weight: 700; }
+  .sched-set p + p { margin-top: 6px; }
+  .sched-set .warn { color: var(--flag); font-weight: 600; }
+  .sched-set .small { font-size: 13.5px; color: var(--pencil); }
+  .cancel { margin-top: 10px; padding: 8px 14px; border-radius: 8px; border: 1.5px solid var(--flag); background: transparent; color: var(--flag); font: 600 14.5px var(--text); }
+  .cancel:hover { background: var(--flag); color: #fff; }
+
+  /* ── the plan: a ruled sheet, not a stack of cards ── */
+  .plan { background: var(--sheet); border: 1px solid var(--rule); border-radius: 8px; padding: 18px 24px 8px; }
+  .plan > h2 { font: 700 19px/1.2 var(--text); margin-bottom: 4px; }
+  .row { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 6px 18px; padding: 16px 0; border-top: 1px solid var(--rule); }
+  .plan > h2 + .row { border-top: 0; }
+  .lbl { font-weight: 600; padding-top: 9px; }
+  .hint { font-size: 13.5px; color: var(--pencil); margin-top: 9px; max-width: 60ch; }
+  .fact { padding-top: 9px; }
+  .fact + .hint { margin-top: 4px; }
+
+  /* tee markers */
+  .markers { display: flex; flex-wrap: wrap; gap: 8px; }
+  .marker {
+    display: inline-flex; align-items: center; gap: 9px; padding: 7px 15px 7px 7px;
+    border: 1.5px solid var(--rule); border-radius: 999px; background: transparent;
+    color: var(--pencil); font: 600 15px var(--text);
+  }
+  .marker .disc { width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--c); display: grid; place-items: center; font: 700 13.5px/1 var(--text); color: #fff; font-style: normal; }
+  .marker[data-c=black] { --c: var(--c-black); }
+  .marker[data-c=black] .disc { border-color: var(--c-black-ring); }
+  .marker[data-c=red] { --c: var(--c-red); }
+  .marker[data-c=green] { --c: var(--c-green); }
+  .marker[data-c=crab-meadow] { --c: var(--c-crab); }
+  .marker:hover { border-color: var(--pencil); }
+  .marker.sel { border-color: var(--ink); color: var(--ink); }
+  .marker.sel .disc { background: var(--c); }
+
+  /* segmented choices */
+  .seg { display: inline-flex; border: 1.5px solid var(--rule); border-radius: 10px; overflow: hidden; max-width: 100%; }
+  .seg > * { position: relative; flex: 1 1 auto; padding: 9px 16px; border: 0; border-left: 1.5px solid var(--rule); background: transparent; color: var(--pencil); font: 600 15px var(--text); text-align: center; cursor: pointer; white-space: nowrap; }
+  .seg > :first-child { border-left: 0; }
+  .seg > .sel { background: var(--ink); color: var(--paper); }
+  .seg > .mode.sel.live { background: var(--flag); color: #fff; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg > .mode:focus-within { outline: 2.5px solid var(--brass-bright); outline-offset: -3px; }
+  .state { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 7px; vertical-align: middle; background: var(--pencil); }
+  .state.up { background: #3FB877; }
+  .state.down { background: var(--flag); }
+
+  details.more { border-top: 1px solid var(--rule); }
+  details.more > summary { padding: 15px 0; font-weight: 600; cursor: pointer; }
+  details.more .row:first-of-type { border-top: 0; padding-top: 2px; }
+  details.more input[type=date] { background: var(--sheet); border: 1.5px solid var(--rule); border-radius: 8px; padding: 8px 10px; font-weight: 600; }
+  .check { display: flex; align-items: flex-start; gap: 10px; padding-top: 8px; cursor: pointer; }
+  .check input { margin-top: 4px; width: 17px; height: 17px; accent-color: var(--fairway); }
+  .check:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px; }
+
+  /* ── last run / live log ─────────────────── */
+  .logbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
+  .logbar h2, .history h2 { font: 700 19px/1.2 var(--text); }
+  .latest.log-collapsed .console { display: none; }
+  .summary { display: none; padding-top: 14px; }
+  .latest.log-collapsed .summary { display: block; }
+  .last { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 20px; font-size: 16px; }
+  .last dt { color: var(--pencil); }
+  .console { margin-top: 14px; background: var(--console); color: var(--console-ink); border-radius: 10px; padding: 14px 16px; font: 12.5px/1.7 var(--mono); max-height: 460px; min-height: 160px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  body.is-running .console { max-height: none; height: clamp(340px, 62vh, 720px); }
+  .console .ln-err { color: #FF9C8A; }
+  .console .ln-warn { color: #F2C25B; }
+  .console .ln-ok { color: #8FE0B0; }
+  .console .ln-dim { color: #8FA397; }
+
+  /* ── earlier runs ────────────────────────── */
+  .history { margin-top: 34px; }
+  .histstats { color: var(--pencil); margin-top: 6px; }
+  .histstats:empty { display: none; }
+  .runs { list-style: none; margin-top: 10px; border-top: 1px solid var(--rule); }
+  .runs li { border-bottom: 1px solid var(--rule); }
+  .runs summary { display: grid; grid-template-columns: 208px minmax(0, 1fr) auto 12px; gap: 4px 18px; padding: 11px 0; align-items: baseline; cursor: pointer; list-style: none; }
+  .runs summary::-webkit-details-marker { display: none; }
+  .runs summary::after { content: ""; width: 7px; height: 7px; border-right: 2px solid var(--pencil); border-bottom: 2px solid var(--pencil); transform: translateY(-3px) rotate(45deg); transition: transform .15s ease; }
+  .runs details[open] > summary::after { transform: translateY(1px) rotate(-135deg); }
+  .runs .when { color: var(--pencil); font-size: 14px; white-space: nowrap; }
+  .runs .what small { display: block; color: var(--pencil); font-size: 13.5px; }
+  .tech { padding: 0 0 14px 226px; color: var(--pencil); font-size: 13.5px; }
+  .tech code { display: block; margin-top: 6px; font: 12.5px/1.6 var(--mono); color: var(--ink); word-break: break-word; }
+  .r-good { color: var(--fairway); font-weight: 700; }
+  .r-bad { color: var(--flag); font-weight: 700; }
+  .r-mid { color: var(--brass); font-weight: 700; }
+  .empty { color: var(--pencil); padding: 14px 0; }
+  #runs-toggle { margin-top: 14px; }
+
+  details.howto { margin-top: 34px; border-top: 1px solid var(--rule); padding-top: 14px; }
+  details.howto summary { font-weight: 600; cursor: pointer; }
+  details.howto ol { margin: 12px 0 0 22px; display: grid; gap: 8px; max-width: 72ch; color: var(--pencil); }
+  details.howto li b { color: var(--ink); font-weight: 600; }
+
+  /* ── one column: board, plan, auto-arm, and the Arm button within thumb reach ── */
+  @media (max-width: 900px) {
+    .grid { display: flex; flex-direction: column; align-items: stretch; gap: 18px; }
+    .board { order: 1; }
+    .plan { order: 2; }
+    .auto { order: 3; }
+    .go { order: 4; position: sticky; bottom: 0; z-index: 5; background: var(--paper); margin: 0 calc(-1 * var(--gutter)); padding: 12px var(--gutter) calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--rule); }
+    .latest { order: 5; margin-top: 10px; }
+    .go .plan-line { font-size: 14.5px; margin-bottom: 8px; }
+    .go .armnote { display: none; }
+    .sched { border-top: 0; padding-top: 0; }
+    body.has-sched .auto { order: 2; }
+    body.has-sched .plan { order: 3; }
+    body.is-running .go { order: 2; position: static; border-top: 0; padding-top: 0; padding-bottom: 0; }
+    body.is-running .latest { order: 3; margin-top: 0; }
+    body.is-running .auto { order: 4; }
+    .top h1 { font-size: 38px; }
+    body { padding-bottom: 28px; }
+  }
+  @media (max-width: 640px) {
+    .runs summary { grid-template-columns: minmax(0, 1fr) auto 12px; }
+    .runs .what { grid-column: 1 / -1; grid-row: 2; }
+    .tech { padding-left: 0; }
+  }
+  @media (max-width: 560px) {
+    .plan { padding: 16px 16px 6px; }
+    .row { grid-template-columns: minmax(0, 1fr); }
+    .lbl, .fact { padding-top: 0; }
+    .board { padding: 20px 20px 22px; }
+    .statusline { font-size: 16.5px; }
+    /* three long labels do not fit side by side on a phone */
+    #modes { display: flex; flex-direction: column; }
+    #modes > * { border-left: 0; border-top: 1.5px solid var(--rule); text-align: left; }
+    #modes > :first-child { border-top: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .lamp i, .verdict.v-ready_click h2 { animation: none !important; }
+    .pl, .runs summary::after { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="top">
+  <h1><span class="mark" aria-hidden="true"><i></i><i></i></span>Bethpage Sniper</h1>
+  <p class="sub" id="sub">Tee times open every night at 7:00 pm, seven days ahead.</p>
+</header>
+
+<div class="grid">
+  <!-- ── the board ── -->
+  <section class="board" id="stage">
+    <div class="board-head">
+      <span class="board-title" id="board-title">Opens in</span>
+      <span class="lamp on-idle" id="dot"><i></i><span id="dot-label">Standing by</span></span>
+    </div>
+    <div id="stage-body"></div>
+  </section>
+
+  <!-- ── tonight's plan ── -->
+  <section class="plan" aria-labelledby="plan-h">
+    <h2 id="plan-h">Tonight’s plan</h2>
+
+    <div class="row">
+      <div class="lbl" id="l-courses">Courses</div>
+      <div>
+        <div class="markers" id="courses" role="group" aria-labelledby="l-courses">
+          <button class="marker" data-c="black" type="button"><i class="disc"></i>Black</button>
+          <button class="marker" data-c="red" type="button"><i class="disc"></i>Red</button>
+          <button class="marker" data-c="green" type="button"><i class="disc"></i>Green</button>
+          <button class="marker" data-c="crab-meadow" type="button"><i class="disc"></i>Crab Meadow</button>
+        </div>
+        <p class="hint" id="course-note"></p>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="lbl" id="l-players">Players</div>
+      <div>
+        <div class="seg" id="players" role="group" aria-labelledby="l-players">
+          <button data-p="1" type="button">1</button>
+          <button data-p="2" type="button">2</button>
+          <button data-p="3" type="button">3</button>
+          <button data-p="4" type="button">4</button>
+        </div>
+        <p class="hint" id="fee-note"></p>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="lbl" id="l-targets">Run on</div>
+      <div>
+        <div class="seg" id="targets" role="group" aria-labelledby="l-targets">
+          <button data-t="aws" type="button">AWS box<i class="state" id="aws-badge"></i></button>
+          <button data-t="mac" type="button" class="sel">This Mac</button>
+          <button data-t="oregon" type="button">GCP VM<i class="state" id="vm-badge"></i></button>
+        </div>
+        <p class="hint" id="target-note"></p>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="lbl" id="l-modes">When it wins a slot</div>
+      <div>
+        <div class="seg" id="modes" role="radiogroup" aria-labelledby="l-modes">
+          <label class="mode sel" data-mode="test"><input type="radio" name="mode" value="test" checked>Test run ($0)</label>
+          <label class="mode" data-mode="live"><input type="radio" name="mode" value="live">Real booking</label>
+          <label class="mode" data-mode="dry"><input type="radio" name="mode" value="dry">Systems check</label>
+        </div>
+        <p class="hint" id="mode-note"></p>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="lbl">Tee time</div>
+      <div>
+        <p class="fact" id="cfg-window">…</p>
+        <p class="hint">Set in the .env file (WINDOW_START, WINDOW_END, SLOT_ORDER).</p>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="lbl">Card</div>
+      <p class="fact" id="cfg-card">…</p>
+    </div>
+
+    <details class="more" id="more">
+      <summary>More options</summary>
+      <div class="row">
+        <div class="lbl"><label for="date-pick">Date</label></div>
+        <div>
+          <input type="date" id="date-pick">
+          <p class="hint" id="date-note"></p>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">Pre-aim</div>
+        <div>
+          <label class="check">
+            <input type="checkbox" id="spec-toggle" checked>
+            <span>Fire a first try at the slot it expects, before the sheet is visible</span>
+          </label>
+          <p class="hint" id="spec-note"></p>
+        </div>
+      </div>
+      <div class="row" id="tools-row">
+        <div class="lbl">Boxes</div>
+        <div>
+          <div class="tools">
+            <button class="quiet" id="sync-aws-btn" type="button">Update the AWS box</button>
+            <button class="quiet" id="sync-btn" type="button">Update the GCP VM</button>
+          </div>
+          <p class="hint">Copies the current code and settings to the box, and starts it if it is off.</p>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ── arm ── -->
+  <section class="go" aria-label="Arm">
+    <p class="plan-line" id="plan-line"></p>
+    <button class="armbtn" id="arm" type="button">Arm test run</button>
+    <p class="armnote" id="armnote"></p>
+  </section>
+
+  <!-- ── auto-arm ── -->
+  <section class="auto" aria-label="Auto-arm">
+    <div class="sched" id="sched"></div>
+  </section>
+
+  <!-- ── last run / live log ── -->
+  <section class="latest log-collapsed" id="stage-panel">
+    <div class="logbar"><h2 id="log-title">Last run</h2><button class="quiet" id="log-toggle" type="button">Show log</button></div>
+    <div class="summary" id="summary"><p class="empty">Nothing has run yet. Set tonight’s plan above, then arm.</p></div>
+    <div class="console" id="console"><span class="ln-dim">The log appears here while a run is going.</span></div>
+  </section>
+</div>
+
+<section class="history">
+  <h2>Earlier runs</h2>
+  <p class="histstats" id="histstats"></p>
+  <div id="history"><p class="empty">No earlier runs yet. Every run shows up here.</p></div>
+</section>
+
+<details class="howto">
+  <summary>How a drop night goes</summary>
+  <ol>
+    <li><b>Any time before:</b> run a Systems check on the machine you plan to use. It should say passed, with nothing flagged.</li>
+    <li><b>Set the plan and arm:</b> pick courses, players and the machine, choose Real booking, then set the auto-arm for about 6:50 pm. Only arm one machine. ForeUp allows one held slot per account.</li>
+    <li><b>At 7:00 pm:</b> on the AWS box it books and pays by itself, and ForeUp emails you the confirmation. On this Mac it stops one click short and you click PROCESS TRANSACTION.</li>
+    <li><b>If it misses:</b> nothing is charged. It keeps watching for slots that come back when other people’s unpaid holds expire.</li>
+  </ol>
+</details>
+
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  let mode = 'test';
+  let target = 'mac';
+  let spec = true;
+  let running = false;
+  let confirmTimer = null;
+  let cardOk = false;
+  let currentSchedule = null;
+  let verdictDismissed = false; // "Back to the countdown" was pressed for the verdict on screen
+
+  let host = 'mac'; // 'mac' = laptop dashboard; 'vm' = this page served from a remote box
+  const MODE_LABEL = { test: 'Arm test run', live: 'Arm real booking', dry: 'Run systems check' };
+  const MODE_NAME = { test: 'Test run ($0)', live: 'Real booking', dry: 'Systems check' };
+  const MACHINE = { mac: 'this Mac', aws: 'the AWS box', oregon: 'the GCP VM' };
+  const TARGET_NOTE = {
+    mac: 'Runs on this Mac in a Chrome window you can see. A real booking fills everything in, then you make the final click.',
+    aws: 'Runs on the AWS box, which sits next to ForeUp’s servers (about 2 ms away). It keeps going if this Mac sleeps. A real booking pays by itself, so the card must be saved and the box updated.',
+    oregon: 'Runs on the GCP VM, the slower backup (about 28 ms from ForeUp). It keeps going if this Mac sleeps. A real booking pays by itself.',
+  };
+  const LIVE_DESC = {
+    mac: 'Wins the slot, enters the code and fills in your card, then waits. You click PROCESS TRANSACTION, and only that click charges the $5 per player fee.',
+    aws: 'Wins the slot and pays the $5 per player fee by itself, from the AWS box. No click from you.',
+    oregon: 'Wins the slot and pays the $5 per player fee by itself, from the GCP VM. No click from you.',
+  };
+  const VM_HOST_NOTE = 'You are on the box’s own dashboard. Runs here have no window: a real booking pays the $5 per player fee by itself.';
+  const MODE_NOTE = {
+    test: 'Races for real and holds an actual slot, then lets it go before anything is charged.',
+    dry: 'Checks login, clock, email and tee-sheet access. Holds nothing and takes about 30 seconds.',
+  };
+  const SPEC_NOTE = 'Only used when it has seen real prices for that kind of day. Otherwise it is skipped automatically and it grabs a slot the moment the sheet appears.';
+  const RESULTS = {
+    booked: ['Booked', 'r-good'], booked_dom_fallback: ['Booked', 'r-good'], booked_nofee: ['Booked', 'r-good'],
+    ready_for_click: ['One click left', 'r-mid'],
+    no_book_abort: ['Test passed', 'r-good'],
+    manual_needed: ['Needed finishing by hand', 'r-mid'],
+    no_hold: ['Lost the race', 'r-bad'], hold_failed: ['Lost the race', 'r-bad'],
+    no_times: ['No times appeared', 'r-bad'], window_empty: ['Nothing in your window', 'r-bad'],
+    mismatch_players: ['Safety stop', 'r-mid'], mismatch_time: ['Safety stop', 'r-mid'], mismatch_schedule: ['Safety stop', 'r-mid'],
+    no_email_code: ['No email code', 'r-bad'], crash: ['Crashed', 'r-bad'],
+    dry_run_ok: ['Systems check passed', 'r-good'],
+  };
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const courseName = (c) => c.split('-').map(cap).join(' ');
+  const courseList = (list) => { const n = list.map(courseName); return n.length > 1 ? `${n[0]} first, then ${n.slice(1).join(', then ')}` : n[0] ?? ''; };
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const timeText = (d) => `${d.getHours() % 12 || 12}:${pad2(d.getMinutes())} ${d.getHours() >= 12 ? 'pm' : 'am'}`;
+  const dayText = (d, opts) => d.toLocaleDateString('en-US', opts);
+  function prettyDate(mdY) { // "10-11-2026" → "Sunday, Oct 11"
+    const [m, d, y] = mdY.split('-').map(Number);
+    return dayText(new Date(y, m - 1, d), { weekday: 'long', month: 'short', day: 'numeric' });
+  }
+
+  // ── run-on picker + box status ──
+  function renderTarget() {
+    document.querySelectorAll('#targets [data-t]').forEach((el) => el.classList.toggle('sel', el.dataset.t === target));
+    $('target-note').textContent = TARGET_NOTE[target];
+    renderModeNote();
+    resetArmButton();
+  }
+  $('targets').addEventListener('click', (e) => {
+    const t = e.target.closest('[data-t]')?.dataset?.t;
+    if (!t || running) return;
+    target = t;
+    renderTarget();
+  });
+  let cardInfo = { present: false, valid: false, issues: [] };
+  function renderCardRow() {
+    const cc = $('cfg-card');
+    if (!cc) return;
+    if (!cardInfo.present) { cc.textContent = 'No card saved. You would type it in at the end.'; cc.style.color = 'var(--brass)'; }
+    else if (!cardInfo.valid) { cc.textContent = 'Problem with the saved card: ' + cardInfo.issues.join('; ') + '.'; cc.style.color = 'var(--flag)'; }
+    else { cc.textContent = 'Saved and valid. It is filled in for you.'; cc.style.color = ''; }
+  }
+  function applyCard(info) { cardInfo = info ?? cardInfo; cardOk = cardInfo.present && cardInfo.valid; renderCardRow(); }
+  function setBadge(el, up, title) { el.className = 'state ' + (up ? 'up' : 'down'); el.title = title; }
+  function pollVm() {
+    fetch('/api/vm').then((r) => r.json()).then((v) => {
+      applyCard(v.card);
+      setBadge($('vm-badge'), v.status === 'RUNNING', `GCP VM is ${String(v.status).toLowerCase()}`);
+    }).catch(() => {});
+  }
+  function pollAws() {
+    fetch('/api/aws').then((r) => r.json()).then((a) => {
+      setBadge($('aws-badge'), a.status === 'running', `AWS box is ${a.status}`);
+    }).catch(() => {});
+  }
+  function applyHost() {
+    if (host !== 'vm') { pollVm(); pollAws(); setInterval(pollVm, 30_000); setInterval(pollAws, 30_000); return; }
+    // This page IS a remote box: no remote targets, no updating, everything is headless.
+    document.querySelector('#targets [data-t=mac]').textContent = 'This box';
+    document.querySelector('#targets [data-t=oregon]').style.display = 'none';
+    document.querySelector('#targets [data-t=aws]').style.display = 'none';
+    $('tools-row').style.display = 'none';
+    TARGET_NOTE.mac = VM_HOST_NOTE;
+    LIVE_DESC.mac = LIVE_DESC.oregon;
+    MACHINE.mac = 'this box';
+    renderTarget();
+  }
+  function bindSync(btnId, tgt, label) {
+    $(btnId).addEventListener('click', async () => {
+      const b = $(btnId);
+      b.disabled = true; b.textContent = 'Updating…';
+      clearConsole(); setLogOpen(true);
+      $('stage-panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      const r = await fetch('/api/vm/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: tgt }) }).then((r) => r.json());
+      if (!r.ok) { alert(r.error); b.disabled = false; b.textContent = label; }
+    });
+  }
+  bindSync('sync-btn', 'oregon', 'Update the GCP VM');
+  bindSync('sync-aws-btn', 'aws', 'Update the AWS box');
+
+  // ── players ──
+  let players = 4;
+  let cfgHoles = '18';
+  function renderPlayers() {
+    document.querySelectorAll('#players [data-p]').forEach((el) => el.classList.toggle('sel', Number(el.dataset.p) === players));
+    $('fee-note').textContent = `Only slots with room for ${players} are taken, ${cfgHoles} holes. The booking fee would be $${5 * players} ($5 per player), charged only if it books.`;
+    resetArmButton();
+  }
+  $('players').addEventListener('click', (e) => {
+    const p = Number(e.target.closest('[data-p]')?.dataset?.p);
+    if (!p || running) return;
+    players = p;
+    renderPlayers();
+  });
+
+  // ── date: defaults to the day that opens tonight (+7); anything else is a
+  //    leftovers hunt (earlier) or Crab Meadow's longer window (up to +8) ──
+  const isoPlusDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+  // Untouched picker → send no --date: turbo computes tonight's ET D+7 when
+  // the run STARTS, so a 'tomorrow' auto-arm or a tab left open overnight
+  // never races a stale date.
+  let dateTouched = false;
+  function pickedDate() { // ISO → turbo's MM-DD-YYYY
+    if (!dateTouched) return undefined;
+    const v = $('date-pick').value;
+    if (!v) return undefined;
+    const [y, m, d] = v.split('-');
+    return `${m}-${d}-${y}`;
+  }
+  function renderDateNote() {
+    const v = $('date-pick').value;
+    const note = $('date-note');
+    note.style.color = '';
+    if (!v || !dateTouched) { note.textContent = 'Automatic: the day that opens at the next 7:00 pm, worked out when the run starts.'; return; }
+    const diff = Math.round((new Date(v + 'T12:00') - new Date(isoPlusDays(0) + 'T12:00')) / 864e5);
+    const days = (n) => `${n} day${n === 1 ? '' : 's'}`;
+    note.textContent = diff === 7 ? 'This is the day that opens tonight.' : diff < 7 ? `${days(diff)} out. That sheet is already open, so this hunts leftovers.` : `${days(diff)} out. That sheet opens ${days(diff - 7)} from now.`;
+    if (diff !== 7) { note.style.color = 'var(--brass)'; $('more').open = true; }
+  }
+  $('date-pick').addEventListener('change', () => { dateTouched = true; renderDateNote(); renderPlanLine(); });
+
+  // ── courses: Bethpage courses mix freely (tap order = priority); Crab Meadow is its own facility ──
+  let courses = ['red', 'green'];
+  const CRAB_NOTE = 'Crab Meadow is a separate ForeUp facility, so it runs alone. It has no email code, which makes it quicker to book.';
+  const BP_NOTE = 'Tap them in the order you want. If more than one is open, the first one wins.';
+  function renderCourses() {
+    document.querySelectorAll('#courses [data-c]').forEach((el) => {
+      const i = courses.indexOf(el.dataset.c);
+      el.classList.toggle('sel', i >= 0);
+      el.setAttribute('aria-pressed', i >= 0 ? 'true' : 'false');
+      el.querySelector('.disc').textContent = i >= 0 && courses.length > 1 ? String(i + 1) : '';
+    });
+    $('course-note').textContent = courses.includes('crab-meadow') ? CRAB_NOTE : BP_NOTE;
+    renderSpec();
+  }
+  $('courses').addEventListener('click', (e) => {
+    const c = e.target.closest('[data-c]')?.dataset?.c;
+    if (!c || running) return;
+    if (c === 'crab-meadow') courses = ['crab-meadow'];
+    else {
+      courses = courses.filter((x) => x !== 'crab-meadow');
+      courses = courses.includes(c) ? courses.filter((x) => x !== c) : [...courses, c];
+      if (!courses.length) courses = [c]; // never allow zero courses
+    }
+    renderCourses();
+  });
+
+  // ── pre-aim (SPEC) toggle — explicitly sent to arm + schedule ──
+  function renderSpec() {
+    const toggle = $('spec-toggle');
+    const unsupported = courses.includes('crab-meadow');
+    if (unsupported) { spec = false; toggle.checked = false; }
+    toggle.disabled = unsupported || running;
+    $('spec-note').textContent = unsupported ? 'Not available for Crab Meadow.' : SPEC_NOTE;
+    resetArmButton();
+  }
+  $('spec-toggle').addEventListener('change', (e) => {
+    if (running || courses.includes('crab-meadow')) return;
+    spec = e.target.checked;
+    renderSpec();
+  });
+
+  // ── what happens when it wins a slot ──
+  function renderModeNote() {
+    $('mode-note').textContent = mode === 'live' ? LIVE_DESC[target] : MODE_NOTE[mode];
+  }
+  $('modes').addEventListener('change', (e) => {
+    mode = e.target.value;
+    document.querySelectorAll('.mode').forEach((el) => el.classList.toggle('sel', el.dataset.mode === mode));
+    document.querySelector('.mode[data-mode=live]').classList.toggle('live', mode === 'live');
+    renderModeNote();
+    resetArmButton();
+  });
+
+  /** One sentence that says what pressing the button will do. Blank while a
+   *  run is going: that run may have been armed with different choices. */
+  function renderPlanLine() {
+    const day = dateTouched && pickedDate() ? ` for ${prettyDate(pickedDate())}` : '';
+    $('plan-line').textContent = running ? ''
+      : mode === 'dry' ? `Systems check on ${MACHINE[target]}. Nothing is held or charged.`
+        : `${courseList(courses)}${day}, ${players} player${players === 1 ? '' : 's'}. ${MODE_NAME[mode]} on ${MACHINE[target]}.`;
+  }
+
+  function resetArmButton() {
+    clearTimeout(confirmTimer);
+    const specToggle = $('spec-toggle');
+    if (specToggle) specToggle.disabled = running || courses.includes('crab-meadow');
+    document.body.classList.toggle('is-running', running);
+    renderPlanLine();
+    $('armnote').textContent = running
+      ? 'A run is going. Disarm stops it.'
+      : target === 'mac' && host !== 'vm'
+        ? 'Chrome opens by itself. Leave it alone unless this page says otherwise.'
+        : 'It runs on the box. You can close this page and press Arm again later to watch it.';
+    const b = $('arm');
+    if (running) { b.textContent = 'Disarm'; b.className = 'armbtn disarm'; b.disabled = false; return; }
+    b.textContent = MODE_LABEL[mode] + (target === 'oregon' ? ' on the GCP VM' : target === 'aws' ? ' on the AWS box' : '');
+    b.className = 'armbtn'; b.disabled = false;
+  }
+
+  // ── arm / disarm with real-money confirm ──
+  $('arm').addEventListener('click', async () => {
+    armAlerts(); // user gesture: unlock the chime + ask for notification permission
+    const b = $('arm');
+    if (running) { await fetch('/api/disarm', { method: 'POST' }); return; }
+    const headlessLive = mode === 'live' && (target !== 'mac' || host === 'vm');
+    if (headlessLive && !cardOk) {
+      alert('A run on a box books by itself and needs the card: fill FEE_CARD_* in .env' + (host === 'vm' ? '.' : ', then update the box.'));
+      return;
+    }
+    if (mode === 'live' && !b.classList.contains('confirm')) {
+      b.textContent = headlessLive
+        ? `Click again to confirm. ${target === 'aws' ? 'The AWS box' : 'The box'} books and charges $${5 * players} by itself.`
+        : 'Click again to confirm. This books for real.';
+      b.classList.add('confirm');
+      confirmTimer = setTimeout(resetArmButton, 6000);
+      return;
+    }
+    clearTimeout(confirmTimer);
+    b.disabled = true;
+    const r = await fetch('/api/arm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, courses, target, players, date: pickedDate(), spec }) }).then((r) => r.json());
+    if (!r.ok) { alert(r.error); resetArmButton(); }
+  });
+
+  // ── auto-arm ──
+  function scheduleWhen(s) {
+    const atD = new Date(s.at);
+    const sameDay = atD.toDateString() === new Date().toDateString();
+    return `${sameDay ? 'today' : dayText(atD, { weekday: 'long' })} at ${timeText(atD)}`;
+  }
+  function renderSchedule(s) {
+    currentSchedule = s || null;
+    document.body.classList.toggle('has-sched', !!s);
+    const box = $('sched');
+    if (s) {
+      const where = (s.courses ?? []).length ? ` Going for ${courseList(s.courses)}${s.players ? `, ${s.players} player${s.players === 1 ? '' : 's'}` : ''}${s.date ? `, for ${prettyDate(s.date)}` : ''}.` : '';
+      const who = s.target === 'mac'
+        ? 'This Mac starts it, and this page keeps the Mac awake until then. Leave it running.'
+        : s.boxArmed
+          ? 'The box starts it by itself, so this Mac can be asleep, closed or offline. Cancel here to stop it.'
+          : 'The box could not be given its own timer, so this Mac has to start it. Keep the Mac awake and online.';
+      box.innerHTML = `<div class="sched-set">
+          <p><b>Auto-arm set.</b> ${esc(MODE_NAME[s.mode] ?? s.mode)} ${esc(scheduleWhen(s))} on ${esc(MACHINE[s.target] ?? s.target)}.${esc(where)}</p>
+          ${s.mode === 'dry' ? '<p class="warn">This is only a systems check. Nothing will race the 7:00 pm drop.</p>' : ''}
+          <p class="small">${esc(who)}${s.spec ? '' : ' Pre-aim is off.'}</p>
+          <button class="cancel" id="sched-cancel" type="button">Cancel auto-arm</button>
+        </div>`;
+      $('sched-cancel').onclick = async () => {
+        const b = $('sched-cancel'); b.disabled = true; b.textContent = 'Cancelling…';
+        const r = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cancel: true }) }).then((r) => r.json()).catch(() => ({ ok: false, error: 'The dashboard did not answer.' }));
+        if (!r.ok) { alert(r.error); b.disabled = false; b.textContent = 'Cancel auto-arm'; }
+      };
+    } else {
+      box.innerHTML = `<span class="sched-lbl">Or start it automatically</span> <select id="sched-day" aria-label="Day"><option value="today">today</option><option value="tomorrow">tomorrow</option></select> <span>at</span> <input type="time" id="sched-time" value="18:50" aria-label="Time"> <button class="quiet" id="sched-btn" type="button">Set auto-arm</button>`;
+      bindSchedBtn();
+    }
+    refreshIdleStatus();
+  }
+  function bindSchedBtn() {
+    $('sched-btn').onclick = async () => {
+      const sb = $('sched-btn'); sb.disabled = true; sb.textContent = 'Setting…'; // a remote box is given its own timer — takes a few seconds
+      const r = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, time: $('sched-time').value, day: $('sched-day')?.value ?? 'today', courses, target, players, date: pickedDate(), spec }) }).then((r) => r.json());
+      if ($('sched-btn')) { $('sched-btn').disabled = false; $('sched-btn').textContent = 'Set auto-arm'; }
+      if (!r.ok) alert(r.error);
+      else if (r.warning) alert(r.warning);
+    };
+  }
+
+  // ── the board: countdown to the next 7:00 pm ──
+  function nextDrop() {
+    const n = new Date(); const d = new Date(n);
+    d.setHours(19, 0, 0, 0);
+    if (d <= n) d.setDate(d.getDate() + 1);
+    return d;
+  }
+  function idleStatus() {
+    if (!currentSchedule) return 'Not armed.';
+    return `Auto-arm set for ${scheduleWhen(currentSchedule)}: ${MODE_NAME[currentSchedule.mode] ?? currentSchedule.mode} on ${MACHINE[currentSchedule.target] ?? currentSchedule.target}.`;
+  }
+  let statusIsIdle = true; // the board's line is ours until the server sends its own
+  function refreshIdleStatus() {
+    const sl = $('statusline');
+    if (sl && !running && statusIsIdle) sl.textContent = idleStatus();
+  }
+  function clockMarkup() {
+    const grp = (id, label) => `<span class="grp"><span class="plates"><b class="pl" id="${id}0">–</b><b class="pl" id="${id}1">–</b></span><small>${label}</small></span>`;
+    return `<div class="clock" id="clock" role="timer" aria-label="Time until tee times open">${grp('ch', 'hours')}<i class="sep" aria-hidden="true"></i>${grp('cm', 'minutes')}<i class="sep" aria-hidden="true"></i>${grp('cs', 'seconds')}</div>
+      <p class="statusline" id="statusline" aria-live="polite"></p>`;
+  }
+  let lastSub = '';
+  function tickClock() {
+    // Keep an untouched picker showing the day that opens next, across midnight.
+    if (!dateTouched && $('date-pick').value && $('date-pick').value !== isoPlusDays(7)) { $('date-pick').value = isoPlusDays(7); renderDateNote(); }
+    const now = new Date();
+    const drop = nextDrop();
+    const tonight = drop.toDateString() === now.toDateString();
+    const dayOpening = (ref) => { const d = new Date(ref); d.setDate(d.getDate() + 7); return d; };
+    const sub = `Tee times for ${dayText(dayOpening(drop), { weekday: 'long', month: 'long', day: 'numeric' })} open ${tonight ? 'tonight' : 'tomorrow'} at 7:00 pm.`;
+    if (sub !== lastSub) { lastSub = sub; $('sub').textContent = sub; $('plan-h').textContent = tonight ? 'Tonight’s plan' : 'Next run'; }
+    if (document.querySelector('.verdict')) return; // the verdict owns the board
+    // During a run, the half hour after 7:00 pm counts UP from the drop
+    // instead of showing 23 hours to the next one.
+    const prev = new Date(drop); prev.setDate(prev.getDate() - 1);
+    const justOpened = running && now - prev < 30 * 60_000;
+    const ref = justOpened ? prev : drop;
+    $('board-title').textContent = `${dayText(dayOpening(ref), { weekday: 'long', month: 'short', day: 'numeric' })} ${justOpened ? 'has been open for' : 'opens in'}`;
+    const ms = justOpened ? now - prev : drop - now;
+    const parts = [Math.floor(ms / 3.6e6), Math.floor(ms % 3.6e6 / 6e4), Math.floor(ms % 6e4 / 1e3)].map(pad2);
+    ['ch', 'cm', 'cs'].forEach((id, i) => {
+      for (const j of [0, 1]) { const el = $(id + j); if (el && el.textContent !== parts[i][j]) el.textContent = parts[i][j]; }
+    });
+    const el = $('clock');
+    if (el) el.classList.toggle('armed', running);
+  }
+  setInterval(tickClock, 250);
+
+  // ── status lamp ──
+  function setDot(cls, label) { $('dot').className = 'lamp ' + cls; $('dot-label').textContent = label; }
+  const PHASE_DOT = {
+    idle: ['on-idle', 'Standing by'], bootstrap: ['on-run', 'Starting up'], ready: ['on-run', 'Armed, systems ready'],
+    waiting: ['on-run', 'Armed, waiting for the drop'], racing: ['on-run', 'Racing'], held: ['on-run', 'Slot held'],
+    booking: ['on-run', 'Booking'], ready_click: ['on-run', 'One click left'], booked: ['on-good', 'Booked'], test_passed: ['on-good', 'Passed'],
+    failed: ['on-bad', 'Did not book'], manual: ['on-bad', 'Needs you'],
+  };
+
+  // ── log toggle ──
+  function setLogOpen(open) {
+    $('stage-panel').classList.toggle('log-collapsed', !open);
+    $('log-toggle').textContent = open ? 'Hide log' : 'Show log';
+    $('log-title').textContent = open ? 'Live log' : 'Last run';
+    if (open) { const c = $('console'); c.scrollTop = c.scrollHeight; }
+  }
+  $('log-toggle').addEventListener('click', () => setLogOpen($('stage-panel').classList.contains('log-collapsed')));
+
+  /** "--no-book --course black,red --players 1 --date 10-05-2026" → "Test run ($0): Black + Red, 1 player, Monday, Oct 5". */
+  function describeRun(args) {
+    const a = ` ${args || ''} `;
+    const val = (flag) => (a.match(new RegExp(` --${flag} (\\S+)`)) ?? [])[1];
+    const kind = a.includes(' --dry-run ') ? 'Systems check' : a.includes(' --no-book ') ? 'Test run ($0)' : a.includes(' --test-payment ') ? 'Payment rehearsal ($0)' : 'Real booking';
+    const where = (val('course') ?? '').split(',').filter(Boolean).map(courseName).join(' + ');
+    const n = val('players');
+    const date = val('date');
+    const bits = [where, n ? `${n} player${n === '1' ? '' : 's'}` : '', date && /^\d{2}-\d{2}-\d{4}$/.test(date) ? prettyDate(date) : ''].filter(Boolean);
+    return bits.length ? `${kind}: ${bits.join(', ')}` : kind;
+  }
+  function fmt12(hhmm) {
+    const [h, m] = hhmm.split(':').map(Number);
+    if (!Number.isFinite(h)) return hhmm;
+    return `${h % 12 || 12}:${pad2(m)} ${h >= 12 ? 'pm' : 'am'}`;
+  }
+  const resultOf = (r) => RESULTS[r.result] ?? [cap(String(r.result).replace(/_/g, ' ')), 'r-mid'];
+  const slotOf = (r) => (r.heldTime ? `${fmt12(r.heldTime.split(' ')[1] ?? '')}${r.heldCourse ? ` on ${courseName(r.heldCourse)}` : ''}` : '');
+
+  function renderSummary(r) {
+    if (!r) return;
+    const [label, cls] = resultOf(r);
+    const at = new Date(r.runAt);
+    const rows = [
+      ['Result', `<span class="${cls}">${esc(label)}</span>`],
+      ['What', esc(describeRun(r.args))],
+      ['When', esc(`${dayText(at, { weekday: 'long', month: 'short', day: 'numeric' })} at ${timeText(at)}`)],
+      slotOf(r) ? ['Slot', esc(slotOf(r))] : null,
+      r.detectMs != null ? ['Speed', `Saw the tee sheet ${Math.round(r.detectMs)} ms after it opened`] : null,
+    ].filter(Boolean);
+    $('summary').innerHTML = `<dl class="last">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
+  }
+
+  // ── console ──
+  /** Each run or update gets a clean log — nothing from the last activity lingers on top. */
+  function clearConsole() {
+    const c = $('console');
+    c.textContent = '';
+    c.dataset.fresh = '1';
+  }
+  function pushLine(line) {
+    const c = $('console');
+    if (c.dataset.fresh !== '1') { c.textContent = ''; c.dataset.fresh = '1'; }
+    const div = document.createElement('div');
+    div.textContent = line;
+    if (line.includes('✗')) div.className = 'ln-err';
+    else if (line.includes('⚠')) div.className = 'ln-warn';
+    else if (line.includes('✓') || line.includes('BOOKED')) div.className = 'ln-ok';
+    div.classList.add('ln');
+    c.appendChild(div);
+    while (c.children.length > 400) c.removeChild(c.firstChild);
+    c.scrollTop = c.scrollHeight;
+  }
+
+  // ── board states ──
+  function showClock(statusText) {
+    $('stage-body').innerHTML = clockMarkup();
+    statusIsIdle = statusText == null;
+    $('statusline').textContent = statusText ?? idleStatus();
+    tickClock();
+  }
+  function showVerdict(v) {
+    if (verdictDismissed) return;
+    const proofable = ['booked', 'ready_click', 'manual'].includes(v.kind);
+    const links = proofable
+      ? `<div class="links" id="proof">${v.kind === 'booked' ? '' : 'Watching your inbox for ForeUp’s confirmation email. This flips to BOOKED ✓ the moment it lands. '}Check for yourself: <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a> or <a href="https://mail.google.com/mail/u/0/#search/from%3Aforeup" target="_blank" rel="noopener">Gmail</a>.</div>` : '';
+    $('board-title').textContent = 'Result';
+    $('stage-body').innerHTML = `
+      <div class="verdict v-${esc(v.kind)}">
+        <h2>${esc(v.title)}</h2>
+        <p aria-live="polite"></p>
+        ${links}
+        <div class="links"><a href="/api/capture" download>Download this run to share</a></div>
+        <button class="back" id="verdict-back" type="button">Back to the countdown</button>
+      </div>`;
+    document.querySelector('.verdict p').textContent = v.detail;
+    $('verdict-back').onclick = () => { verdictDismissed = true; setDot(...PHASE_DOT.idle); showClock(); };
+  }
+
+  // ── make the result impossible to miss: tab title, favicon, notification, chime ──
+  function setFav(emoji) {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d'); x.font = '54px serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(emoji, 32, 38);
+    let l = document.querySelector('link[rel=icon]');
+    if (!l) { l = document.createElement('link'); l.rel = 'icon'; document.head.appendChild(l); }
+    l.href = c.toDataURL();
+  }
+  setFav('⛳');
+  let audioCtx = null;
+  function armAlerts() { // must run inside a user gesture
+    if (!audioCtx) try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+  }
+  function chime(good) {
+    if (!audioCtx) return;
+    const notes = good ? [523, 659, 784, 1047] : [330, 262];
+    notes.forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.type = 'sine'; o.connect(g); g.connect(audioCtx.destination);
+      const t = audioCtx.currentTime + i * 0.16;
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.03); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      o.start(t); o.stop(t + 0.55);
+    });
+  }
+  function notify(title, body) {
+    if ('Notification' in window && Notification.permission === 'granted') try { new Notification(title, { body }); } catch {}
+  }
+  function announceVerdict(v) {
+    const good = v.kind === 'booked' || v.kind === 'test_passed';
+    const attention = v.kind === 'ready_click' || v.kind === 'manual';
+    document.title = `${good ? '✅' : attention ? '🟠' : '❌'} ${v.title} | Bethpage Sniper`;
+    setFav(good ? '✅' : attention ? '🟠' : '❌');
+    chime(good || attention);
+    notify(`${v.title}`, v.detail.slice(0, 120));
+  }
+
+  // ── live updates ──
+  function connect() {
+    const es = new EventSource('/api/stream');
+    es.addEventListener('hello', (e) => {
+      const s = JSON.parse(e.data);
+      running = s.running; resetArmButton();
+      const [cls, lbl] = PHASE_DOT[s.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      if (s.verdict) showVerdict(s.verdict);
+      else if (s.statusText && s.running) { showClock(s.statusText); }
+      if (s.running) setLogOpen(true);
+      if ((s.lines ?? []).length) clearConsole(); // a reconnect replays the whole log — never stack it twice
+      (s.lines ?? []).forEach(pushLine);
+    });
+    es.addEventListener('armed', () => { running = true; verdictDismissed = false; document.title = 'Bethpage Sniper'; setFav('⛳'); resetArmButton(); clearConsole(); showClock('Starting…'); setLogOpen(true); });
+    es.addEventListener('line', (e) => {
+      const d = JSON.parse(e.data);
+      pushLine(d.line);
+      const [cls, lbl] = PHASE_DOT[d.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      const sl = $('statusline'); if (sl) { sl.textContent = d.statusText; statusIsIdle = false; }
+    });
+    es.addEventListener('verdict', (e) => {
+      const d = JSON.parse(e.data);
+      running = false; verdictDismissed = false; resetArmButton();
+      const [cls, lbl] = PHASE_DOT[d.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
+      showVerdict(d.verdict);
+      announceVerdict(d.verdict);
+      loadHistory();
+    });
+    es.addEventListener('proof', (e) => {
+      const d = JSON.parse(e.data);
+      const p = $('proof');
+      if (!p) return;
+      if (d.emailFound) p.innerHTML = `✅ Confirmation email received at ${esc(d.at)}: “${esc(d.subject)}”. See it under <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a>.`;
+      else p.innerHTML = `⚠️ No confirmation email after 12 minutes. If you clicked PROCESS TRANSACTION, check <a href="https://foreupsoftware.com/index.php/booking/19765/2432#/account" target="_blank" rel="noopener">ForeUp reservations</a>. If you did not, the hold expired and nothing was charged.`;
+    });
+    es.addEventListener('schedule', (e) => renderSchedule(JSON.parse(e.data).schedule));
+    es.addEventListener('sync', () => {
+      const b = $('sync-btn'); b.disabled = false; b.textContent = 'Update the GCP VM';
+      const a = $('sync-aws-btn'); a.disabled = false; a.textContent = 'Update the AWS box';
+      pollVm(); pollAws();
+    });
+    es.onerror = () => { es.close(); setTimeout(connect, 2000); };
+  }
+
+  // ── start: board first, then settings from the server ──
+  showClock();
+  renderSchedule(null);
+  renderTarget();
+  connect();
+
+  fetch('/api/state').then((r) => r.json()).then((s) => {
+    host = s.host ?? 'mac';
+    applyCard(s.card);
+    applyHost();
+    const c = s.config ?? {};
+    courses = (c.COURSE ?? 'red,green').split(',').map((x) => x.trim()).filter(Boolean);
+    renderCourses();
+    const ws = c.WINDOW_START ?? '6:30', we = c.WINDOW_END ?? '8:30', fb = c.FALLBACK_UNTIL ?? we;
+    $('cfg-window').textContent = `Between ${ws} and ${we} am, ${c.SLOT_ORDER ?? 'latest'} slot first${fb !== we ? `. If that is empty, the next one up to ${fb}` : ''}.`;
+    players = Math.min(4, Math.max(1, parseInt(c.PLAYERS ?? '4', 10) || 4));
+    cfgHoles = c.HOLES ?? '18';
+    renderPlayers();
+    const td = (c.TARGET_DATE ?? '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    $('date-pick').value = td ? `${td[3]}-${td[1]}-${td[2]}` : isoPlusDays(7);
+    dateTouched = !!td; // an explicit .env TARGET_DATE is a deliberate choice
+    renderDateNote();
+    renderPlanLine();
+    if (s.schedule) renderSchedule(s.schedule);
+  });
+
+  // ── earlier runs: plain English; the timings and flags open on a click ──
+  let earlierRuns = [];
+  let showAllRuns = false;
+  function renderHistory() {
+    if (!earlierRuns.length) return;
+    const shown = showAllRuns ? earlierRuns : earlierRuns.slice(0, 6);
+    const rows = shown.map((r) => {
+      const [label, cls] = resultOf(r);
+      const at = new Date(r.runAt);
+      const brief = [slotOf(r) ? `Held ${slotOf(r)}.` : '', r.detectMs != null ? `Saw the sheet in ${Math.round(r.detectMs)} ms.` : ''].filter(Boolean).join(' ');
+      const tech = [
+        r.detectMs != null ? `Saw the sheet ${Math.round(r.detectMs)} ms after it opened.` : '',
+        r.avgPollRtt != null ? `Each check of the sheet took about ${r.avgPollRtt} ms.` : '',
+        r.totalMs != null ? `The whole run took ${(r.totalMs / 1000).toFixed(2)} s.` : '',
+      ].filter(Boolean).join(' ');
+      return `<li><details><summary><span class="${cls}">${esc(label)}</span>
+        <span class="what">${esc(describeRun(r.args))}${brief ? `<small>${esc(brief)}</small>` : ''}</span>
+        <span class="when">${esc(`${dayText(at, { month: 'short', day: 'numeric' })}, ${timeText(at)}`)}</span></summary>
+        <div class="tech">${esc(tech)}<code>${esc(r.args || '(default settings)')}</code></div></details></li>`;
+    }).join('');
+    $('history').innerHTML = `<ul class="runs">${rows}</ul>${earlierRuns.length > 6 ? `<button class="quiet" id="runs-toggle" type="button">${showAllRuns ? 'Show fewer' : `Show all ${earlierRuns.length}`}</button>` : ''}`;
+    const t = $('runs-toggle');
+    if (t) t.onclick = () => { showAllRuns = !showAllRuns; renderHistory(); };
+  }
+  function loadHistory() {
+    fetch('/api/history').then((r) => r.json()).then(({ runs, stats }) => {
+      $('histstats').textContent = stats ? `${stats.drops} real drop${stats.drops > 1 ? 's' : ''} on record. It usually sees the sheet about ${stats.medianDetectMs} ms after it opens.` : '';
+      if (!runs.length) return;
+      renderSummary(runs[0]); // the last run in plain English; the raw log stays one click away
+      earlierRuns = runs.slice(1);
+      renderHistory();
+    });
+  }
+  loadHistory();
+})();
+</script>
+</body>
+</html>

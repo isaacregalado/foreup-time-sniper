@@ -1321,6 +1321,32 @@ section('Dashboard SPEC passthrough — ui-server.ts wiring contract');
   assert(html.includes("unsupported = courses.includes('crab-meadow')"), 'dashboard spec: unmapped Crab Meadow disables speculative holds');
 }
 
+// The redesign preview (/next) must keep every control wired exactly like the
+// current page: same payloads, same money gates, same element ids.
+if (fs.existsSync('static/turbo-ui-next.html')) {
+  const ui = fs.readFileSync('src/ui-server.ts', 'utf8');
+  const next = fs.readFileSync('static/turbo-ui-next.html', 'utf8');
+  const script = next.slice(next.indexOf('<script>'), next.lastIndexOf('</script>'));
+  assert(ui.includes("url === '/next' && fs.existsSync(HTML_NEXT_PATH)"), 'preview: served at /next, beside the current page');
+  assert(next.includes('id="spec-toggle" checked'), 'preview spec: toggle defaults on');
+  assertEqual(next.match(/date: pickedDate\(\), spec/g)?.length ?? 0, 2, 'preview spec: arm and schedule payloads both send date + toggle');
+  assert(next.includes('JSON.stringify({ mode, courses, target, players, date: pickedDate(), spec })'), 'preview: arm payload is identical to the current page');
+  assert(next.includes("JSON.stringify({ mode, time: $('sched-time').value, day: $('sched-day')?.value ?? 'today', courses, target, players, date: pickedDate(), spec })"), 'preview: schedule payload is identical to the current page');
+  assert(next.includes("s.spec ? '' : ' Pre-aim is off.'"), 'preview spec: scheduled state reports pre-aim off');
+  assert(next.includes("unsupported = courses.includes('crab-meadow')"), 'preview spec: Crab Meadow disables speculative holds');
+  assert(next.includes('if (!dateTouched) return undefined;'), 'preview date: untouched picker never freezes --date');
+  assert(next.includes("if (mode === 'live' && !b.classList.contains('confirm')) {"), 'preview money gate: a real booking needs a second, confirming click');
+  assert(next.includes('if (headlessLive && !cardOk) {'), 'preview money gate: a box run without a valid card is refused');
+  assert(/<input type="radio" name="mode" value="test" checked>/.test(next) && !/value="live" checked/.test(next), 'preview money gate: the page always opens on the $0 test run');
+  assert(next.includes(`s.mode === 'dry' ? '<p class="warn">This is only a systems check.`), 'preview: a scheduled systems check says it will not race the drop');
+  // every element the script reaches for exists, in the markup or in a template it renders
+  const ids = [...new Set([...script.matchAll(/\$\('([a-z0-9-]+)'\)/g)].map((m) => m[1]))];
+  assertDeepEqual(ids.filter((id) => !next.includes(`id="${id}"`)), [], 'preview: every element id the script uses exists');
+  assert(ids.length > 30, 'preview: the id check actually found the script’s lookups');
+  // server- and inbox-provided strings are never injected as markup
+  assert(next.includes('<h2>${esc(v.title)}</h2>') && next.includes('“${esc(d.subject)}”'), 'preview: verdict title and email subject are escaped');
+}
+
 section('Turbo race-policy wiring contract');
 
 {
