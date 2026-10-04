@@ -142,8 +142,24 @@
 
   .console { flex: 1; background: #081510; padding: 14px 18px; font: 12px/1.75 var(--mono); overflow-y: auto; min-height: 180px; white-space: pre-wrap; word-break: break-all; }
   .console .ln-err { color: #F08D7A; }
+  .console .ln-warn { color: var(--amber); }
   .console .ln-ok { color: #8FD4A8; }
   .console .ln-dim { color: var(--muted); }
+
+  /* Raw log is a detail, not the headline: collapsed while idle, opened
+     automatically when a run is armed. The summary speaks plain English. */
+  .logbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 18px; background: #0B1A12; border-bottom: 1px solid var(--line); }
+  .logbar .eyebrow { margin: 0; }
+  .logbar button { font: 600 12px/1 var(--sans, inherit); padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--ink); cursor: pointer; }
+  .logbar button:hover { border-color: var(--brass-lo); }
+  .stage.log-collapsed .console { display: none; }
+  .summary { display: none; flex: 1; padding: 20px 22px; overflow-y: auto; }
+  .stage.log-collapsed .summary { display: block; }
+  .summary h4 { font: 600 11px/1 var(--mono); letter-spacing: .2em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+  .summary .last { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 15px; line-height: 1.45; }
+  .summary .last dt { color: var(--muted); }
+  .summary .last dd { margin: 0; }
+  .summary .tip { margin-top: 18px; font-size: 14px; line-height: 1.55; color: var(--muted); max-width: 60ch; }
 
   /* ── playbook ─────────────────────────────── */
   .playbook { margin-top: 18px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
@@ -275,7 +291,7 @@
   </div>
 
   <!-- ── state panel ── -->
-  <div class="stage">
+  <div class="stage log-collapsed" id="stage-panel">
     <div class="stage-top" id="stage">
       <div class="phase-dot on-idle" id="dot"><i></i><span class="eyebrow" id="dot-label">standing by</span></div>
       <div id="stage-body">
@@ -284,6 +300,8 @@
         <div class="statusline" id="statusline">Not armed. Pick a mode and arm when you’re ready.</div>
       </div>
     </div>
+    <div class="logbar"><span class="eyebrow" id="log-title">Last run</span><button id="log-toggle" type="button">Show details</button></div>
+    <div class="summary" id="summary"><p class="tip">Nothing has run yet. Pick where, how many players and a mode on the left, then arm.</p></div>
     <div class="console" id="console"><span class="ln-dim">Log will stream here when you arm.</span></div>
   </div>
 </div>
@@ -404,6 +422,7 @@
     $(btnId).addEventListener('click', async () => {
       const b = $(btnId);
       b.disabled = true; b.textContent = 'Syncing…';
+      clearConsole(); setLogOpen(true);
       const r = await fetch('/api/vm/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: tgt }) }).then((r) => r.json());
       if (!r.ok) { alert(r.error); b.disabled = false; b.textContent = label; }
     });
@@ -581,13 +600,62 @@
     failed: ['on-bad', 'did not book'], manual: ['on-bad', 'needs you'],
   };
 
+  // ── details toggle ──
+  function setLogOpen(open) {
+    $('stage-panel').classList.toggle('log-collapsed', !open);
+    $('log-toggle').textContent = open ? 'Hide details' : 'Show details';
+    $('log-title').textContent = open ? 'Live log' : 'Last run';
+    if (open) { const c = $('console'); c.scrollTop = c.scrollHeight; }
+  }
+  $('log-toggle').addEventListener('click', () => setLogOpen($('stage-panel').classList.contains('log-collapsed')));
+
+  /** "--no-book --course black,red --players 1" → "$0 test · Black + Red · 1 player". */
+  function describeRun(args) {
+    const a = ` ${args || ''} `;
+    const val = (flag) => (a.match(new RegExp(` --${flag} (\\S+)`)) ?? [])[1];
+    const mode = a.includes(' --dry-run ') ? 'Systems check' : a.includes(' --no-book ') ? '$0 test run' : a.includes(' --test-payment ') ? 'Payment test ($0)' : 'Real booking';
+    const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+    const courses = (val('course') ?? '').split(',').filter(Boolean).map((c) => cap(c.replace('-', ' '))).join(' + ');
+    const players = val('players');
+    const date = val('date');
+    return [mode, courses, players ? `${players} player${players === '1' ? '' : 's'}` : '', date ? `for ${date}` : ''].filter(Boolean).join(' · ');
+  }
+
+  function renderSummary(r) {
+    if (!r) return;
+    const [label, cls] = RESULTS[r.result] ?? [r.result.toUpperCase(), 'r-mid'];
+    const when = new Date(r.runAt).toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    const slot = r.heldTime ? `${fmt12(r.heldTime.split(' ')[1] ?? '')} ${r.heldCourse ? '· ' + r.heldCourse : ''}` : null;
+    const rows = [
+      ['Result', `<span class="${cls}"><b>${label}</b></span>`],
+      ['What', describeRun(r.args)],
+      ['When', when],
+      slot ? ['Slot', slot] : null,
+      r.detectMs != null ? ['Speed', `saw the tee sheet ${Math.round(r.detectMs)}ms after it opened`] : null,
+    ].filter(Boolean);
+    $('summary').innerHTML = `<dl class="last">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+      <p class="tip">Ready for the next one? Choose where, how many players and a mode on the left, then arm. The live log opens here by itself.</p>`;
+  }
+  function fmt12(hhmm) {
+    const [h, m] = hhmm.split(':').map(Number);
+    if (!Number.isFinite(h)) return hhmm;
+    return `${h % 12 || 12}:${String(m).padStart(2, '0')}${h >= 12 ? 'pm' : 'am'}`;
+  }
+
   // ── console ──
+  /** Each run or sync gets a clean log — nothing from the last activity lingers on top. */
+  function clearConsole() {
+    const c = $('console');
+    c.textContent = '';
+    c.dataset.fresh = '1';
+  }
   function pushLine(line) {
     const c = $('console');
     if (c.dataset.fresh !== '1') { c.textContent = ''; c.dataset.fresh = '1'; }
     const div = document.createElement('div');
     div.textContent = line;
-    if (line.includes('✗') || line.includes('⚠')) div.className = 'ln-err';
+    if (line.includes('✗')) div.className = 'ln-err';
+    else if (line.includes('⚠')) div.className = 'ln-warn';
     else if (line.includes('✓') || line.includes('BOOKED')) div.className = 'ln-ok';
     div.classList.add('ln');
     c.appendChild(div);
@@ -664,9 +732,10 @@
       const [cls, lbl] = PHASE_DOT[s.phase] ?? PHASE_DOT.idle; setDot(cls, lbl);
       if (s.verdict) showVerdict(s.verdict);
       else if (s.statusText && s.running) { showClock(s.statusText); }
+      if (s.running) setLogOpen(true);
       (s.lines ?? []).forEach(pushLine);
     });
-    es.addEventListener('armed', () => { running = true; resetArmButton(); showClock('Starting…'); });
+    es.addEventListener('armed', () => { running = true; resetArmButton(); clearConsole(); showClock('Starting…'); setLogOpen(true); });
     es.addEventListener('line', (e) => {
       const d = JSON.parse(e.data);
       pushLine(d.line);
@@ -728,21 +797,8 @@
         document.querySelector('.history .wrap').before(p);
       }
       if (!runs.length) return;
-      // Idle console shows the last run's receipt instead of sitting empty.
-      const c = $('console');
-      if (c.dataset.fresh !== '1' && runs[0]) {
-        const r = runs[0];
-        const [label] = RESULTS[r.result] ?? [r.result.toUpperCase()];
-        c.innerHTML = '';
-        [`last run · ${new Date(r.runAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
-         `  result:   ${label}`,
-         r.heldTime ? `  slot:     ${(r.heldTime.split(' ')[1] ?? '')} ${r.heldCourse ?? ''}` : null,
-         r.detectMs != null ? `  detect:   +${r.detectMs}ms after the drop` : null,
-         `  flags:    ${r.args || '(defaults)'}`,
-         '', 'arm a run to stream live from here.'].filter((x) => x !== null).forEach((t) => {
-          const div = document.createElement('div'); div.className = 'ln-dim'; div.textContent = t; c.appendChild(div);
-        });
-      }
+      // Idle panel shows the last run in plain English (raw log stays one click away).
+      renderSummary(runs[0]);
       const rows = runs.map((r) => {
         const [label, cls] = RESULTS[r.result] ?? [r.result.toUpperCase(), 'r-mid'];
         const when = new Date(r.runAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });

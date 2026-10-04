@@ -79,7 +79,7 @@ function vmStatus(): Promise<string> {
 // Its public IP changes on stop/start, so it is resolved live from the EC2 API.
 const AWS_BOX = { name: 'bethpage-sniper', region: 'us-west-2', user: 'ubuntu' };
 const AWS_KEY = path.join(process.env.HOME ?? '', '.ssh', 'bethpage-sniper-key.pem');
-const AWS_SSH_OPTS = ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=10', '-i', AWS_KEY];
+const AWS_SSH_OPTS = ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=10', '-i', AWS_KEY]; // LogLevel: no known-hosts chatter in the run log
 let awsCache: { status: string; ip: string | null; at: number } = { status: 'unknown', ip: null, at: 0 };
 let awsProbe: Promise<{ status: string; ip: string | null }> | null = null;
 
@@ -256,13 +256,25 @@ function emitVerdict() {
 
 /** A systems check can pass while running degraded (SPEC off, no ForeUp clock
  *  bound, blind detector, wrong date). Surface that in the verdict itself. */
+const TARGET_LABEL: Record<string, string> = { mac: 'this Mac', aws: 'the AWS box', oregon: 'the GCP VM' };
+
+/** Plain-English systems-check result. Only real problems are DEGRADED;
+ *  SPEC being off (no fee data yet) is a normal state — the detect-first
+ *  race still runs — so it is a calm note, not a warning. */
 function dryDetail(): string {
-  const base = 'Login, clock sync, email and tee-sheet access all work. Nothing was held or charged.';
-  const degraded = state.lines
-    .filter((l) => /spec disabled|no safe predicted|ForeUp probe|API detector unhealthy|DATE CHECK|detector poll/.test(l))
+  const where = IS_MAC ? TARGET_LABEL[state.target ?? 'mac'] ?? 'this machine' : 'this box';
+  const base = `Checked on ${where}: login, clock, email and tee-sheet access all work. Nothing was held or charged.`;
+  const clean = (l: string) => l.replace(/^\s*[✗⚠✓ℹ…]\s*(\[[^\]]*\]\s*)?/, '').slice(0, 140);
+  const problems = state.lines
+    .filter((l) => /API detector unhealthy|DATE CHECK|detector poll (rejected|blocked)|Clock offset: machine clock|could not be staged|Bridge preflight|flow markers MISSING/.test(l))
     .slice(0, 3)
-    .map((l) => l.replace(/^\s*[✗⚠✓ℹ…]\s*(\[[^\]]*\]\s*)?/, '').slice(0, 140));
-  return degraded.length ? `${base} DEGRADED: ${degraded.join(' · ')}` : base;
+    .map(clean);
+  const specOff = state.lines.some((l) => /spec disabled|no safe predicted/.test(l));
+  const note = specOff
+    ? ' Note: SPEC (the pre-aimed shot) is off — no full-rate fee data for this day type yet — so it races detect-first, the way July’s booking was won.'
+    : '';
+  const hint = IS_MAC && (state.target ?? 'mac') === 'mac' ? ' To check the race machine, pick AWS us-west-2 and run this again.' : '';
+  return problems.length ? `DEGRADED — fix before 7pm: ${problems.join(' · ')}. ${base}` : `${base}${note}${hint}`;
 }
 
 function finalizeRun(code: number | null) {
@@ -403,9 +415,12 @@ function startSync(target: 'oregon' | 'aws' = 'oregon'): { ok: boolean; error?: 
   const script = target === 'aws' ? 'deploy/aws-setup.sh' : 'deploy/gcp-setup.sh';
   const label = target === 'aws' ? 'AWS box' : 'Oregon VM';
   syncChild = spawn('bash', [script], { cwd: ROOT });
+  state.lines = []; // a sync is its own activity — never mix it into the previous run's log
+  // Routine apt/ssh/npm chatter says nothing useful; keep the step lines.
+  const NOISE = /Permanently added .* to the list of known hosts|is already the newest version|^\s*(Hit|Get|Ign):\d+ |Reading package lists|Building dependency tree|Reading state information|npm notice|^\s*Installing dependencies\.\.\.$|0 upgraded, 0 newly installed/;
   const push = (d: Buffer) => d.toString().split('\n').forEach((raw) => {
     const line = raw.trimEnd();
-    if (!line.trim()) return;
+    if (!line.trim() || NOISE.test(line)) return;
     state.lines.push(`  ↺ ${line}`);
     if (state.lines.length > 400) state.lines.shift();
     broadcast('line', { line: `  ↺ ${line}`, phase: state.phase, statusText: `Syncing code + settings to the ${label}…` });

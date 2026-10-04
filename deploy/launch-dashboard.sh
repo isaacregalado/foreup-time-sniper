@@ -18,4 +18,6 @@ if ! lsof -tiTCP:4747 -sTCP:LISTEN >/dev/null 2>&1; then
     sleep 0.5
   done
 fi
+# Phone access rides on Tailscale (https://isaacs-macbook-pro.taila51196.ts.net:8443)
+pgrep -qx Tailscale || open -ga Tailscale
 open "http://localhost:4747"

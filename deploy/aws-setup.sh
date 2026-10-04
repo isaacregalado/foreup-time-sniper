@@ -99,7 +99,7 @@ PUBIP=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 echo "   Public IP: $PUBIP"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY_FILE")
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$KEY_FILE")  # LogLevel: no known-hosts chatter
 vm() { ssh "${SSH_OPTS[@]}" "ubuntu@$PUBIP" "$@"; }
 
 echo "→ Waiting for SSH..."
