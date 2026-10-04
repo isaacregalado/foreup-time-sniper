@@ -430,7 +430,12 @@
   //    leftovers hunt (earlier) or Crab Meadow's longer window (up to +8) ──
   const pad2 = (n) => String(n).padStart(2, '0');
   const isoPlusDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+  // Untouched picker → send no --date: turbo computes tonight's ET D+7 when
+  // the run STARTS, so a 'tomorrow' auto-arm or a tab left open overnight
+  // never races a stale date.
+  let dateTouched = false;
   function pickedDate() { // ISO → turbo's MM-DD-YYYY
+    if (!dateTouched) return undefined;
     const v = $('date-pick').value;
     if (!v) return undefined;
     const [y, m, d] = v.split('-');
@@ -439,11 +444,12 @@
   function renderDateNote() {
     const v = $('date-pick').value;
     if (!v) { $('date-note').textContent = '(auto: +7)'; return; }
+    if (!dateTouched) { $('date-note').textContent = 'drop day (+7) — auto, recomputed at run time'; $('date-note').style.color = 'var(--muted)'; return; }
     const diff = Math.round((new Date(v + 'T12:00') - new Date(isoPlusDays(0) + 'T12:00')) / 864e5);
     $('date-note').textContent = diff === 7 ? 'drop day (+7)' : diff < 7 ? `+${diff}d — sheet already live` : `+${diff}d — drops ${diff - 7}d from now`;
     $('date-note').style.color = diff === 7 ? 'var(--muted)' : 'var(--amber)';
   }
-  $('date-pick').addEventListener('change', renderDateNote);
+  $('date-pick').addEventListener('change', () => { dateTouched = true; renderDateNote(); });
 
   // ── course picker: Bethpage courses mix freely; Crab Meadow is exclusive ──
   let courses = ['red', 'green'];
@@ -529,7 +535,7 @@
       const atD = new Date(s.at);
       const sameDay = atD.toDateString() === new Date().toDateString();
       const t = (sameDay ? '' : atD.toLocaleDateString('en-US', { weekday: 'short' }) + ' ') + atD.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-      box.innerHTML = `<span class="set">auto-arm set: ${MODE_LABEL[s.mode].replace('Arm ', '').replace('Run ', '')} at ${t}${s.courses ? ' · ' + s.courses.join('+') : ''}${s.spec ? ' · SPEC' : ' · detect-first'}${s.target === 'oregon' ? ' · on GCP VM' : s.target === 'aws' ? ' · on AWS' : ''}</span> <button class="cancel" id="sched-cancel">Cancel</button>`;
+      box.innerHTML = `<span class="set">auto-arm set: ${MODE_LABEL[s.mode].replace('Arm ', '').replace('Run ', '')} at ${t}${s.courses ? ' · ' + s.courses.join('+') : ''}${s.spec ? ' · SPEC' : ' · detect-first'}${s.date ? ' · ' + s.date : ' · date auto (D+7 at run time)'}${s.target === 'oregon' ? ' · on GCP VM' : s.target === 'aws' ? ' · on AWS' : ''}</span> <button class="cancel" id="sched-cancel">Cancel</button>`;
       $('schednote').style.display = '';
       $('sched-cancel').onclick = async () => { await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cancel: true }) }); };
     } else {
@@ -554,6 +560,8 @@
     return d;
   }
   function tickClock() {
+    // Keep an untouched picker showing tonight's drop date across midnight.
+    if (!dateTouched && $('date-pick').value && $('date-pick').value !== isoPlusDays(7)) { $('date-pick').value = isoPlusDays(7); renderDateNote(); }
     if (document.querySelector('.verdict')) return; // verdict owns the panel
     const ms = nextDrop() - new Date();
     const h = String(Math.floor(ms / 3.6e6)).padStart(2, '0');
@@ -704,6 +712,7 @@
     renderPlayers();
     const td = (c.TARGET_DATE ?? '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
     $('date-pick').value = td ? `${td[3]}-${td[1]}-${td[2]}` : isoPlusDays(7);
+    dateTouched = !!td; // an explicit .env TARGET_DATE is a deliberate choice
     renderDateNote();
     if (s.schedule) renderSchedule(s.schedule);
   });

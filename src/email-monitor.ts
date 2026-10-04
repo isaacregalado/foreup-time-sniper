@@ -30,6 +30,30 @@ export function bookingCodeContextMatches(text: string, expected: BookingCodeExp
   return dateMatches && (compact.includes(timeToken) || compact.includes(paddedTimeToken));
 }
 
+/** Pick a booking code from ForeUp message texts (newest first). Codes in
+ * `exclude` were already rejected by ForeUp: when Red and Green both held the
+ * same date+time, the released loser's code email is indistinguishable from
+ * the winner's (the body has no course name), so checkout may need the next
+ * candidate. */
+export function pickBookingCode(
+  textsNewestFirst: string[], expected?: BookingCodeExpectation, exclude: ReadonlySet<string> = new Set(),
+): string | null {
+  for (const plainText of textsNewestFirst) {
+    if (expected && !bookingCodeContextMatches(plainText, expected)) continue;
+    // "booking code is: XXXXXX" first (most reliable), then a standalone 6-digit number
+    const code = plainText.match(/booking code\s*(?:is)?[:\s]+(\d{5,8})/i)?.[1] ?? plainText.match(/\b(\d{6})\b/)?.[1];
+    if (code && !exclude.has(code)) return code;
+  }
+  return null;
+}
+
+/** Race a promise against a deadline (IMAP calls have no native timeout). */
+function within<T>(p: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${timeoutMs}ms`)), timeoutMs); });
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
+}
+
 export class EmailMonitor {
   private client: ImapFlow;
   private connected = false;
@@ -52,6 +76,13 @@ export class EmailMonitor {
       logger: false,
     });
     client.on('close', () => { this.connected = false; });
+    // ImapFlow emits 'error' on socket faults. With no listener, EventEmitter
+    // THROWS — an uncaught exception that would kill a run mid-race. Mark the
+    // session dead instead; the next use reconnects.
+    client.on('error', (err: Error) => {
+      this.connected = false;
+      console.warn(`  ⚠ IMAP session error (${err?.message ?? err}) — will reconnect on next use`);
+    });
     return client;
   }
 
@@ -84,6 +115,20 @@ export class EmailMonitor {
     await this.resetBaseline();
   }
 
+  /** Checkout-path baseline: a bounded NOOP on the existing session; if the
+   * socket is dead or half-open, reconnect once (connect() re-baselines).
+   * The IMAP session idles through the whole drop, so this must never be
+   * able to eat the 5-minute hold. */
+  async ensureFreshBaseline(timeoutMs = 6000): Promise<void> {
+    if (this.connected && this.client.usable) {
+      try { await within(this.resetBaseline(), timeoutMs, 'IMAP baseline'); return; } catch { /* reconnect below */ }
+    }
+    this.connected = false;
+    try { this.client.close(); } catch { /* already closed */ }
+    this.client = this.newClient();
+    await within(this.connect(), timeoutMs, 'IMAP reconnect');
+  }
+
   /** Reset baseline to current message count — call right before clicking tee time */
   async resetBaseline(): Promise<void> {
     const lock = await this.client.getMailboxLock('INBOX');
@@ -96,7 +141,9 @@ export class EmailMonitor {
   }
 
   /** Poll for the booking code email. Returns the code string. */
-  async waitForBookingCode(timeoutMs = 60_000, expected?: BookingCodeExpectation): Promise<string> {
+  async waitForBookingCode(
+    timeoutMs = 60_000, expected?: BookingCodeExpectation, exclude: ReadonlySet<string> = new Set(),
+  ): Promise<string> {
     if (!this.connected) throw new Error('Not connected');
 
     const deadline = Date.now() + timeoutMs;
@@ -108,7 +155,9 @@ export class EmailMonitor {
         const current = this.mailboxCount();
 
         if (current > this.baselineCount) {
-          const code = await this.scanNewMessages(this.baselineCount + 1, current, expected);
+          // A returned code does not advance the baseline: if ForeUp rejects
+          // it, the retry rescans this batch with that code excluded.
+          const code = await this.scanNewMessages(this.baselineCount + 1, current, expected, exclude);
           if (code) return code;
           this.baselineCount = current;
         }
@@ -122,36 +171,29 @@ export class EmailMonitor {
     throw new Error('Timed out waiting for booking code');
   }
 
-  private async scanNewMessages(from: number, to: number, expected?: BookingCodeExpectation): Promise<string | null> {
+  private async scanNewMessages(
+    from: number, to: number, expected?: BookingCodeExpectation, exclude: ReadonlySet<string> = new Set(),
+  ): Promise<string | null> {
     const sources: Buffer[] = [];
     for await (const msg of this.client.fetch(`${from}:${to}`, { source: true })) {
       if (msg.source) sources.push(msg.source);
     }
     // A deliberate winner resend is newer than any auto-sent loser code.
     // Inspect newest-first so both arriving in one NOOP cycle stays safe.
+    const texts: string[] = [];
     for (const source of sources.reverse()) {
       try {
         const parsed = await simpleParser(source);
-
         // Check sender first — only process foreUP emails
-        const from = parsed.from?.text?.toLowerCase() ?? '';
-        if (!from.includes('foreup') && !from.includes('bethpage')) continue;
-
+        const sender = parsed.from?.text?.toLowerCase() ?? '';
+        if (!sender.includes('foreup') && !sender.includes('bethpage')) continue;
         // Search text body (not HTML — avoids matching CSS hex, tracking IDs)
-        const plainText = [parsed.subject, parsed.text].filter(Boolean).join(' ');
-        if (expected && !bookingCodeContextMatches(plainText, expected)) continue;
-
-        // Look for "booking code is: XXXXXX" pattern first (most reliable)
-        const specific = plainText.match(/booking code\s*(?:is)?[:\s]+(\d{5,8})/i);
-        if (specific) return specific[1];
-        // Fallback: find a standalone 6-digit number
-        const sixDigit = plainText.match(/\b(\d{6})\b/);
-        if (sixDigit) return sixDigit[1];
+        texts.push([parsed.subject, parsed.text].filter(Boolean).join(' '));
       } catch (e) {
         console.warn(`Could not parse a new booking-code email: ${(e as Error).message}`);
       }
     }
-    return null;
+    return pickBookingCode(texts, expected, exclude);
   }
 
   async disconnect(): Promise<void> {

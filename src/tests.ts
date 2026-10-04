@@ -8,8 +8,19 @@
  */
 
 import * as fs from 'fs';
-import { bookingCodeContextMatches } from './email-monitor';
-import { firstModalIdentityMismatch, missingSpecTemplateFields, settleWithin } from './turbo-guards';
+import { bookingCodeContextMatches, EmailMonitor, pickBookingCode } from './email-monitor';
+import {
+  classifyTimesResponse, etDropTargetDate, firstModalIdentityMismatch, isSoftLimitRejection, missingSpecTemplateFields,
+  pollPhase, poolWarmSockets, settleWithin, specRunMode, vultureRetryDelayMs,
+} from './turbo-guards';
+import {
+  causalOffsetInterval, fuseClockOffset, pickNtpSample, planPreDropMs, planSpecOffsets, probeServerDate,
+  releaseSendBracket, summarizeReleaseRuns, type DateSample,
+} from './clock-sync';
+import {
+  dayClassOf, fullRateAnchorOf, isoDate, isWeekendDate, latticePhase, mergeSpecTemplate, pickFullRateAnchor,
+  predictWindowFromAnchor, snapshotFileName, specPayloadDiff, specPredictTimes, specScoutDates, specShotIsLate, specShotTarget,
+} from './spec-template';
 
 // ────────────────────────────────────────────────────────────
 // Test harness
@@ -784,72 +795,7 @@ const W_END = 8 * 60;        // 8:00
 
 // ════════════════════════════════════════════════════════════
 
-section('SPEC hold — turbo.ts sheet prediction (scout dates / template merge / predict)');
-
-// From turbo.ts — specScoutDates + mergeSpecTemplate + specPredictTimes (mirrored; keep in sync)
-function isWeekendDate(mdY: string): boolean {
-  const [m, d, y] = mdY.split('-').map(Number);
-  const dow = new Date(y, m - 1, d).getDay();
-  return dow === 0 || dow === 6;
-}
-function specScoutDates(targetMdY: string, todayMdY: string): string[] {
-  const [tm, td, ty] = todayMdY.split('-').map(Number);
-  const out: string[] = [];
-  for (let i = 0; i <= 7; i++) {
-    const d = new Date(ty, tm - 1, td + i);
-    const s = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}-${d.getFullYear()}`;
-    if (s !== targetMdY) out.push(s);
-  }
-  const tgtWknd = isWeekendDate(targetMdY);
-  const dayNum = (s: string) => { const [m, d, y] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
-  const tgtN = dayNum(targetMdY);
-  return out.sort((a, b) => {
-    const aw = isWeekendDate(a) === tgtWknd ? 0 : 1, bw = isWeekendDate(b) === tgtWknd ? 0 : 1;
-    if (aw !== bw) return aw - bw;
-    return Math.abs(dayNum(a) - tgtN) - Math.abs(dayNum(b) - tgtN);
-  });
-}
-type SpecTime = { time: string; available_spots?: number; [k: string]: any };
-function mergeSpecTemplate(scouts: SpecTime[][]): Map<string, SpecTime> {
-  const tpl = new Map<string, SpecTime>();
-  for (const times of scouts) for (const t of times ?? []) {
-    const hhmm = t.time.split(' ')[1];
-    if (hhmm && !tpl.has(hhmm)) tpl.set(hhmm, t);
-  }
-  return tpl;
-}
-function inferSpecWindowFromFullRateAnchor(times: SpecTime[], windowStart: number, windowEnd: number): SpecTime[] {
-  const parsed = times.map((t) => {
-    const hhmm = t.time.split(' ')[1] ?? '';
-    const [hh, mm] = hhmm.split(':').map(Number);
-    return { t, min: hh * 60 + mm };
-  }).filter((x) => Number.isFinite(x.min));
-  const anchor = parsed.filter((x) => x.min >= windowStart && x.min <= windowEnd).sort((a, b) => a.min - b.min)[0]
-    ?? parsed.filter((x) => x.min > windowEnd && x.min <= 16 * 60).sort((a, b) => a.min - b.min)[0];
-  if (!anchor) return times;
-  const datePart = anchor.t.time.split(' ')[0];
-  const seen = new Set(parsed.map((x) => x.min));
-  const inferred: SpecTime[] = [];
-  for (let min = windowStart; min <= windowEnd; min++) {
-    if ((anchor.min - min) % 9 !== 0 || seen.has(min)) continue;
-    const hh = Math.floor(min / 60), mm = min % 60;
-    inferred.push({ ...anchor.t, time: `${datePart} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, spec_inferred: true });
-  }
-  return [...inferred, ...times];
-}
-function specPredictTimes(tpl: Map<string, SpecTime>, iso: string, players: number): SpecTime[] {
-  return [...tpl.entries()].map(([hhmm, t]) => ({ ...t, time: `${iso} ${hhmm}`, available_spots: players }));
-}
-function planSpecShots<T>(cands: T[], offsets: number[]): Array<{ cand: T; scheduledOffsetMs: number }> {
-  return cands.slice(0, offsets.length).map((cand, i) => ({ cand, scheduledOffsetMs: offsets[i] }));
-}
-function specShotIsLate(actualOffsetMs: number, scheduledOffsetMs: number, toleranceMs = 150): boolean {
-  return actualOffsetMs > scheduledOffsetMs + toleranceMs;
-}
-function snapshotFileName(courseKey: string, date: string, savedAt: string, seq: number, kind: string, pid: number): string {
-  const stamp = savedAt.replace(/[^0-9]/g, '');
-  return `${courseKey}-${date}-${stamp}-${pid}-${String(seq).padStart(3, '0')}-${kind}.json`;
-}
+section('SPEC hold — spec-template.ts sheet prediction (scout dates / fee proof / lattice / predict)');
 
 // Weekday target 7 days out (Mon 07-20 armed on Mon 07-13): all 7 published
 // dates kept, closest weekday first, weekend dates last.
@@ -875,6 +821,13 @@ function snapshotFileName(courseKey: string, date: string, savedAt: string, seq:
   assert(dates.includes('08-01-2026'), 'scout dates: rolls into August');
 }
 
+// Holidays are explicit opt-in weekend-rate days.
+{
+  assertEqual(dayClassOf('10-12-2026'), 'weekday', 'day class: Columbus Day is a weekday unless listed');
+  assertEqual(dayClassOf('10-12-2026', new Set(['10-12-2026'])), 'weekend', 'day class: listed holiday uses weekend fees');
+  assertEqual(specScoutDates('10-12-2026', '10-05-2026', new Set(['10-12-2026']))[0], '10-11-2026', 'scout dates: holiday target prefers weekend neighbors');
+}
+
 // Template merge: preferred scout wins per time-of-day, later scouts fill gaps
 {
   const sat = [{ time: '2026-07-18 06:30', green_fee: 70, teesheet_side_id: 1 }];
@@ -889,13 +842,23 @@ function snapshotFileName(courseKey: string, date: string, savedAt: string, seq:
 }
 
 // Prediction: date swapped in, spots = requested players (→ hold's players
-// field via viewTime; server rejects players > actual spots), fields carried
+// field via viewTime; server rejects players > actual spots), fields carried,
+// start_front + per-holes spots re-derived like a real tile.
 {
-  const tpl = mergeSpecTemplate([[{ time: '2026-07-18 06:30', green_fee: 70, available_spots: 1 }]]);
-  const pred = specPredictTimes(tpl, '2026-07-20', 1);
-  assertEqual(pred[0].time, '2026-07-20 06:30', 'predict: target date swapped into slot time');
-  assertEqual(pred[0].available_spots, 1, 'predict: spots pinned to requested players');
-  assertEqual(pred[0].green_fee, 70, 'predict: createPending fields carried through');
+  const tpl = new Map([['08:27', { time: '2026-07-20 15:21', available_spots: 1, available_spots_18: 1, start_front: 202606201521, green_fee: 43 }]]);
+  const [p] = specPredictTimes(tpl, '07-21-2026', 4, 18);
+  assertEqual(p.time, '2026-07-21 08:27', 'predict: target date swapped into slot time');
+  assertEqual(p.available_spots, 4, 'predict: spots pinned to requested players');
+  assertEqual(p.available_spots_18, 4, 'predict: per-holes spots match the party');
+  assertEqual(p.start_front, 202606210827, 'predict: start_front re-derived with zero-based month');
+  assertEqual(p.green_fee, 43, 'predict: createPending fields carried through');
+}
+
+// Pins the start_front assumption against a real saved row shape.
+{
+  const real = { time: '2026-08-03 09:48', start_front: 202607030948 };
+  const [p] = specPredictTimes(new Map([['09:48', real]]), '08-03-2026', 1);
+  assertEqual(p.start_front, real.start_front, 'predict: start_front formula reproduces a real ForeUp row');
 }
 
 // Prediction feeds the existing ranking unchanged: earliest in-window wins
@@ -905,20 +868,23 @@ function snapshotFileName(courseKey: string, date: string, savedAt: string, seq:
     { time: '2026-07-18 06:30', available_spots: 1 },
     { time: '2026-07-18 05:50', available_spots: 1 },
   ]]);
-  const pred = specPredictTimes(tpl, '2026-07-20', 4).map((t) => ({ time: t.time, available_spots: t.available_spots ?? 0 }));
+  const pred = specPredictTimes(tpl, '07-20-2026', 4).map((t) => ({ time: t.time, available_spots: t.available_spots ?? 0 }));
   const ranked = rankCandidates(pred, W_START, W_END, 4);
   assertEqual(ranked[0]?.time, '2026-07-20 06:30', 'predict+rank: earliest in-window slot is the spec target');
   assert(ranked.every((c) => c.inWindow), 'predict+rank: dawn slot excluded');
 }
 
-// Ranked SPEC plan spends later offsets on later-ranked candidates, not the
-// same already-contested slot, and never exceeds the offset budget.
+// Shot targeting: blind shots aim the top prediction; once a poll has seen
+// the sheet, only a listed first shot fires and every backup yields.
 {
-  const plan = planSpecShots(['red-8:27', 'red-8:18', 'red-8:09'], [150, 450]);
-  assertDeepEqual(plan, [
-    { cand: 'red-8:27', scheduledOffsetMs: 150 },
-    { cand: 'red-8:18', scheduledOffsetMs: 450 },
-  ], 'spec plan: distinct ranked candidates fit the fixed shot budget');
+  const ranked = ['2026-08-10 08:27', '2026-08-10 08:18', '2026-08-10 08:09'];
+  const id = (x: string) => x;
+  assertEqual(specShotTarget(ranked, 0, undefined, id), '2026-08-10 08:27', 'spec shot: first shot is the top prediction');
+  assertEqual(specShotTarget(ranked, 1, undefined, id), '2026-08-10 08:27', 'spec shot: still-blind backup re-aims the top slot');
+  assertEqual(specShotTarget(ranked, 1, new Set(['2026-08-10 08:27']), id), undefined, 'spec shot: backup yields to the informed detect walk');
+  assertEqual(specShotTarget(ranked, 0, new Set(['2026-08-10 08:27']), id), '2026-08-10 08:27', 'spec shot: listed first shot still fires');
+  assertEqual(specShotTarget(ranked, 0, new Set(['2026-08-10 08:18']), id), undefined, 'spec shot: unlisted first shot is superseded by detection');
+  assertEqual(specShotTarget([] as string[], 0, undefined, id), undefined, 'spec shot: no prediction, no shot');
 }
 
 // A slow first response must not turn the second fixed-offset shot into a
@@ -928,41 +894,56 @@ function snapshotFileName(courseKey: string, date: string, savedAt: string, seq:
   assert(specShotIsLate(601, 450), 'spec deadline: >150ms-late backup is skipped');
 }
 
-// A same-day-type full-rate Red anchor safely supplies the constant hold
-// fields while the observed 9-minute lattice supplies morning timestamps.
+// Fee proof: only rows that PROVE they are pre-twilight may price a morning.
 {
-  const expanded = inferSpecWindowFromFullRateAnchor(
-    [{ time: '2026-07-25 15:57', available_spots: 1, green_fee: 48, teesheet_side_id: 1016 }],
-    6 * 60 + 30,
-    8 * 60 + 30,
-  );
-  const tpl = mergeSpecTemplate([expanded]);
-  const pred = specPredictTimes(tpl, '2026-07-26', 1).map((t) => ({ time: t.time, available_spots: t.available_spots ?? 0 }));
-  const ranked = rankCandidates(pred, 6 * 60 + 30, 8 * 60 + 30, 1, 8 * 60 + 30, 'latest');
-  assertEqual(ranked[0]?.time, '2026-07-26 08:27', 'spec inference: latest valid Red grid slot is 8:27');
-  assertEqual(tpl.get('08:27')?.green_fee, 48, 'spec inference: weekend full-rate fee carried to morning');
-  assertEqual(tpl.get('08:27')?.teesheet_side_id, 1016, 'spec inference: Red side carried to morning');
+  const rec = (date: string, rows: Array<[string, number]>, course = 'red') => ({
+    course, date, savedAt: `${date}T00:00:00Z`,
+    times: rows.map(([hm, fee]) => ({ time: `${isoDate(date)} ${hm}`, green_fee: fee, teesheet_side_id: 1016 })),
+  });
+  assertEqual(fullRateAnchorOf(rec('07-20-2026', [['15:21', 43], ['17:36', 26]]))?.evidence, 'step', 'fee proof: a later lower fee proves the earlier row is full rate');
+  assertEqual(fullRateAnchorOf(rec('10-06-2026', [['15:03', 29], ['15:12', 29]])), null, 'fee proof: a pre-4pm row with no step is NOT proof (fall twilight)');
+  assertEqual(fullRateAnchorOf(rec('08-03-2026', [['09:48', 43], ['17:54', 26]]))?.evidence, 'morning', 'fee proof: a morning row is proof');
+  // Weekday proof never prices a weekend.
+  const weekendOnlyTwilight = rec('08-08-2026', [['16:42', 29], ['18:21', 29]]);
+  const weekdayMorning = rec('08-03-2026', [['09:48', 43]]);
+  const none = pickFullRateAnchor([weekendOnlyTwilight, weekdayMorning], 'red', '08-09-2026');
+  assertEqual(none.anchor, null, 'fee proof: twilight-only weekend library disables SPEC');
+  assert(none.reason.includes('red/weekend'), 'fee proof: disabled reason names course + day class');
+  // A weekend capture enables it.
+  const weekendDrop = rec('08-08-2026', [['06:30', 52], ['08:54', 52], ['16:42', 29]]);
+  assertEqual(pickFullRateAnchor([weekendOnlyTwilight, weekendDrop], 'red', '08-09-2026').anchor?.t.green_fee, 52, 'fee proof: one weekend drop capture arms weekend SPEC');
+  // Morning proof outranks a newer step proof; new fee era makes old proof stale.
+  const step = rec('09-28-2026', [['14:00', 43], ['17:00', 26]]);
+  const morning = rec('09-07-2026', [['09:48', 43], ['17:54', 26]]);
+  assertEqual(pickFullRateAnchor([step, morning], 'red', '10-06-2026').anchor?.evidence, 'morning', 'fee proof: morning proof outranks step proof');
+  const laterTwilight = rec('09-29-2026', [['17:09', 26]]);
+  assertEqual(pickFullRateAnchor([morning, laterTwilight], 'red', '10-06-2026').anchor?.date, '09-07-2026', 'fee proof: an already-seen twilight fee later does not mark the proof stale');
+  const newEra = rec('10-01-2026', [['16:00', 22]]);
+  assertEqual(pickFullRateAnchor([morning, newEra], 'red', '10-06-2026').anchor, null, 'fee proof: a never-seen newer fee marks the old proof stale');
+  // twilight → super-twilight step must not pass as full rate
+  const superTwi = rec('09-29-2026', [['16:51', 26], ['18:21', 20]]);
+  const top = rec('09-30-2026', [['10:30', 43]]);
+  assertEqual(pickFullRateAnchor([superTwi, top], 'red', '10-06-2026').anchor?.t.green_fee, 43, 'fee proof: a twilight → super-twilight step loses to the top fee');
 }
 
-// Twilight-only anchors are never extrapolated into the morning fee band.
+// Lattice: phase from every sheet, prediction only on-phase.
 {
-  const twilight = [{ time: '2026-07-19 16:51', available_spots: 1, green_fee: 29 }];
-  const expanded = inferSpecWindowFromFullRateAnchor(twilight, 6 * 60 + 30, 8 * 60 + 30);
-  assertEqual(expanded.length, 1, 'spec inference: post-4pm twilight anchor creates no morning slots');
-  assertEqual(expanded[0].time, '2026-07-19 16:51', 'spec inference: twilight source remains unchanged');
+  const recs = [{ course: 'red', date: '08-08-2026', savedAt: '', times: [{ time: '2026-08-08 16:42' }, { time: '2026-08-08 18:21' }] }];
+  assertEqual(latticePhase(recs, 'red'), 3, 'lattice: twilight-only sheet still pins phase 3');
+  const anchor = { t: { time: '2026-08-03 10:24', green_fee: 43 }, min: 624, date: '08-03-2026', evidence: 'morning' as const };
+  const rows = predictWindowFromAnchor(anchor, 3, 363, 539);
+  assertEqual(rows.length, 20, 'lattice: 6:03–8:59 holds 20 nine-minute slots');
+  assertEqual(rows[rows.length - 1].time, '2026-08-03 08:54', 'lattice: last in-window slot is 8:54');
+  assertEqual(predictWindowFromAnchor({ ...anchor, min: 621 }, 3, 363, 539).length, 0, 'lattice: off-phase anchor predicts nothing');
+  assertEqual(predictWindowFromAnchor(anchor, null, 363, 539).length, 0, 'lattice: unknown phase predicts nothing');
 }
 
-// One surviving morning slot is enough to reconstruct the rest of its
-// full-rate 9-minute lattice; sparse availability must not force SPEC to 6:39.
+// Accuracy check: predictions are diffed against the real first drop sheet.
 {
-  const sparse = inferSpecWindowFromFullRateAnchor(
-    [{ time: '2026-07-18 06:39', available_spots: 1, green_fee: 48, teesheet_side_id: 1016 }],
-    6 * 60 + 30,
-    8 * 60 + 30,
-  );
-  const tpl = mergeSpecTemplate([sparse]);
-  assertEqual(tpl.get('08:27')?.green_fee, 48, 'spec inference: sparse morning expands through the latest valid slot');
-  assertEqual(tpl.get('06:39')?.spec_inferred, undefined, 'spec inference: observed anchor wins over its inferred duplicate');
+  const pred = { time: '2026-08-09 08:54', available_spots: 4, teesheet_side_id: 1016, foreup_discount: false, foreup_trade_discount_rate: 0, trade_min_players: 0, cart_fee: 0, cart_fee_tax: 0, green_fee: 50, green_fee_tax: 0 };
+  assertDeepEqual(specPayloadDiff(pred, { ...pred }), [], 'spec check: identical payload passes');
+  assertDeepEqual(specPayloadDiff(pred, { ...pred, green_fee: 52 }), ['green_fee'], 'spec check: fee drift is named');
+  assertDeepEqual(specPayloadDiff(pred, undefined), ['<slot absent from first drop sheet>'], 'spec check: missing slot is reported');
 }
 
 // Immutable snapshot names preserve every capture and identify provenance.
@@ -976,74 +957,13 @@ function snapshotFileName(courseKey: string, date: string, savedAt: string, seq:
 
 // ════════════════════════════════════════════════════════════
 
-section('Server-clock sync — turbo.ts tick-boundary offset math');
+section('Release epoch — turbo.ts 7pm math');
 
-// From turbo.ts — noisy Date-transition selection (mirrored; keep in sync)
-type ServerFlip = { offsetMs: number; gapMs: number };
-function serverOffsetFromFlip(previousMidpointMs: number, currentMidpointMs: number, newSecondEpochMs: number): ServerFlip {
-  return {
-    offsetMs: Math.round(newSecondEpochMs - (previousMidpointMs + currentMidpointMs) / 2),
-    gapMs: Math.round(currentMidpointMs - previousMidpointMs),
-  };
-}
-function selectServerOffset(flips: ServerFlip[]): number | null {
-  const ranked = flips.filter((f) => f.gapMs > 0 && f.gapMs <= 400).sort((a, b) => a.gapMs - b.gapMs);
-  if (!ranked.length) return null;
-  const tight = ranked.filter((f) => f.gapMs <= ranked[0].gapMs + 50).slice(0, 3);
-  const offsets = tight.map((f) => f.offsetMs).sort((a, b) => a - b);
-  if (offsets.length % 2) return offsets[Math.floor(offsets.length / 2)];
-  return Math.round((offsets[offsets.length / 2 - 1] + offsets[offsets.length / 2]) / 2);
-}
-function trustedClockOffset(foreupMs: number | null, ntpMs: number | null): { offsetMs: number; source: string } {
-  const delta = foreupMs !== null && ntpMs !== null ? foreupMs - ntpMs : null;
-  if (foreupMs !== null && (delta === null || Math.abs(delta) <= 125)) return { offsetMs: foreupMs, source: 'foreup' };
-  if (ntpMs !== null) return { offsetMs: ntpMs, source: 'ntp' };
-  return { offsetMs: 0, source: 'local' };
-}
+// From turbo.ts (mirrored; keep in sync)
 function sevenPmEpoch(serverNowMs: number): number {
   const d = new Date(serverNowMs);
   d.setHours(19, 0, 0, 0);
   return d.getTime();
-}
-
-// Last-old and first-new samples symmetrically bracket the boundary.
-{
-  const serverSec = Date.UTC(2026, 6, 14, 0, 31, 14); // .000 of the flipped second
-  const flip = serverOffsetFromFlip(serverSec - 600, serverSec - 400, serverSec);
-  assertEqual(flip.offsetMs, 500, 'clock: local 500ms behind → +500ms offset');
-  assertEqual(flip.gapMs, 200, 'clock: transition carries its uncertainty bracket');
-}
-
-// Local clock 300ms AHEAD of the server → negative offset
-{
-  const serverSec = Date.UTC(2026, 6, 14, 0, 31, 14);
-  assertEqual(serverOffsetFromFlip(serverSec + 200, serverSec + 400, serverSec).offsetMs, -300, 'clock: local 300ms ahead → -300ms offset');
-}
-
-// Perfectly synced → ~0 (sub-ms rounding)
-{
-  const serverSec = Date.UTC(2026, 6, 14, 0, 31, 14);
-  assertEqual(serverOffsetFromFlip(serverSec - 50.4, serverSec + 49.6, serverSec).offsetMs, 0, 'clock: synced → 0ms offset');
-}
-
-// Pick tight transitions, reject RTT outliers, and median the best three.
-{
-  const picked = selectServerOffset([
-    { offsetMs: 198, gapMs: 275 },
-    { offsetMs: 18, gapMs: 178 },
-    { offsetMs: 27, gapMs: 163 },
-    { offsetMs: -400, gapMs: 900 },
-  ]);
-  assertEqual(picked, 23, 'clock: tight-bracket median rejects a wide outlier');
-  assertEqual(selectServerOffset([{ offsetMs: 1, gapMs: 0 }, { offsetMs: 2, gapMs: 401 }]), null, 'clock: no trustworthy transition falls back');
-}
-
-// ForeUp remains primary only while its noisy whole-second header agrees
-// with DNS-corrected NTP; otherwise NTP is the safe fallback.
-{
-  assertEqual(trustedClockOffset(36, 27).source, 'foreup', 'clock: agreeing ForeUp sample stays primary');
-  assertEqual(trustedClockOffset(-90, 50).source, 'ntp', 'clock: >125ms disagreement falls back to NTP');
-  assertEqual(trustedClockOffset(null, null).source, 'local', 'clock: total sync failure uses local clock explicitly');
 }
 
 // now()/msUntil7pm use offset additively: a +500ms offset advances our clock,
@@ -1072,7 +992,226 @@ function sevenPmEpoch(serverNowMs: number): number {
 }
 
 // ════════════════════════════════════════════════════════════
+section('Clock sync v2 — clock-sync.ts (causal Date interval, NTP fusion, bounded probe)');
+
+// Virtual network + server for deterministic probe tests. server = local + theta;
+// the Date header is stamped at the END of processing (nginx-like).
+function fakeForeUp(opts: { theta: number; upMs: number; procMs: number; downMs: number; fail?: 'always' | 'never'; noDate?: boolean }) {
+  let t = 1_000_000.25;
+  let calls = 0;
+  return {
+    calls: () => calls,
+    deps: {
+      nowMs: () => t,
+      sleep: async (ms: number) => { t += Math.max(0, ms); },
+      fetchDate: async (timeoutMs: number) => {
+        calls++;
+        if (opts.fail === 'always') { t += 1; throw new Error('ECONNRESET'); }
+        const total = opts.upMs + opts.procMs + opts.downMs;
+        if (total > timeoutMs) { t += timeoutMs; throw new Error('timeout'); }
+        const stampLocal = t + opts.upMs + opts.procMs;
+        t += total;
+        if (opts.noDate) return null;
+        return new Date(Math.floor((stampLocal + opts.theta) / 1000) * 1000).toUTCString();
+      },
+    },
+  };
+}
+
+{
+  assertDeepEqual(pickNtpSample([{ offsetMs: 60, rttMs: 40 }, { offsetMs: 45, rttMs: 8 }, { offsetMs: 52, rttMs: 15 }]),
+    { offsetMs: 45, rttMs: 8 }, 'ntp: minimum-delay sample wins over the median offset');
+  assertEqual(pickNtpSample([]), null, 'ntp: no samples -> null');
+}
+
+{
+  // theta = 37: samples straddling one boundary bound theta causally.
+  const theta = 37;
+  const mk = (sendMs: number, rtt: number, stampFrac = 1): DateSample => {
+    const stamp = sendMs + rtt * stampFrac;
+    return { sendMs, recvMs: sendMs + rtt, serverSecMs: Math.floor((stamp + theta) / 1000) * 1000 };
+  };
+  const samples = [mk(10_880, 80), mk(10_890, 80), mk(10_900, 80), mk(10_910, 80), mk(11_400, 82)];
+  const iv = causalOffsetInterval(samples)!;
+  assert(iv.lo <= theta && theta <= iv.hi, `causal interval: contains true offset (${iv.lo}..${iv.hi})`);
+  assert(iv.hi - iv.lo <= 100, 'causal interval: width bounded by one request time + bracket');
+  // One sample from a backend whose clock is 3s off is out-voted, not averaged in.
+  const poisoned = causalOffsetInterval([...samples, { sendMs: 11_500, recvMs: 11_580, serverSecMs: 15_000 }])!;
+  assert(poisoned.lo <= theta && theta <= poisoned.hi, 'causal interval: Marzullo majority ignores a mis-set backend');
+  // A slow (queued) sample is filtered rather than widening/narrowing wrongly.
+  assertEqual(causalOffsetInterval([...samples, mk(12_000, 900)])!.used, 5, 'causal interval: RTT outlier excluded');
+  assertEqual(causalOffsetInterval([]), null, 'causal interval: no samples -> null');
+}
+
+{
+  const iv = { lo: 20, hi: 110, votes: 4, used: 4, minRttMs: 80 };
+  assertDeepEqual(fuseClockOffset(45, iv), { offsetMs: 45, source: 'ntp', correctionMs: 0, foreupLo: 20, foreupHi: 110 },
+    'fusion: NTP inside ForeUp interval stays exact (no +RTT/2 Date bias)');
+  assertEqual(fuseClockOffset(-30, iv).offsetMs, 20, 'fusion: ForeUp proves its clock is ahead -> nearest edge');
+  assertEqual(fuseClockOffset(-30, iv).source, 'ntp+foreup', 'fusion: correction is labeled');
+  assertEqual(fuseClockOffset(-900, iv).offsetMs, -900, 'fusion: absurd >500ms correction is refused (broken probe)');
+  assertEqual(fuseClockOffset(null, iv).source, 'foreup', 'fusion: no NTP -> local clock clamped into ForeUp interval');
+  assertEqual(fuseClockOffset(null, null).source, 'local', 'fusion: nothing -> machine clock, explicitly');
+  assertEqual(fuseClockOffset(45, { ...iv, votes: 1 }).source, 'ntp', 'fusion: a single Date sample cannot move NTP');
+}
+
+await (async () => {
+  // AWS-like: 1ms each way, 75ms PHP time, Date stamped at the end. True theta = 3.
+  const srv = fakeForeUp({ theta: 3, upMs: 1, procMs: 75, downMs: 1 });
+  const r = await probeServerDate(srv.deps, { budgetMs: 6000, priorOffsetMs: 3 });
+  assertEqual(r.reason, 'ok', 'probe: healthy server -> ok');
+  assert(r.interval!.lo <= 3 && 3 <= r.interval!.hi, `probe: interval contains truth (${r.interval!.lo}..${r.interval!.hi})`);
+  assert(r.interval!.lo >= -10, 'probe: bisection pins the tight (late-stamp) side within ~10ms');
+  assert(r.elapsedMs <= 6000 && r.requests <= 12, `probe: bounded (${r.requests} req, ${r.elapsedMs}ms)`);
+  assertEqual(fuseClockOffset(1, r.interval).offsetMs, 1, 'probe+fusion: disciplined server keeps NTP');
+  // Server 60ms AHEAD of UTC: NTP says 3 but truth is 63 -> fusion moves toward ForeUp.
+  const ahead = fakeForeUp({ theta: 63, upMs: 1, procMs: 75, downMs: 1 });
+  const ra = await probeServerDate(ahead.deps, { budgetMs: 6000, priorOffsetMs: 3 });
+  const fused = fuseClockOffset(3, ra.interval).offsetMs;
+  assert(Math.abs(fused - 63) <= 12, `probe+fusion: ForeUp drift of +60ms is tracked (${fused})`);
+})();
+
+await (async () => {
+  // Regression for the unbounded loop: every request fails instantly.
+  const dead = fakeForeUp({ theta: 0, upMs: 1, procMs: 1, downMs: 1, fail: 'always' });
+  const r = await probeServerDate(dead.deps, { budgetMs: 6000 });
+  assertEqual(r.reason, 'no_samples', 'probe: dead network -> explicit reason, not a hang');
+  assert(r.elapsedMs <= 6000, `probe: dead network returns inside budget (${r.elapsedMs}ms)`);
+  assert(dead.calls() <= 8, `probe: errors back off instead of hammering (${dead.calls()} attempts)`);
+  // Every response slower than the per-request timeout (Aug-2 Sunday-afternoon shape).
+  const slow = fakeForeUp({ theta: 0, upMs: 35, procMs: 2000, downMs: 35 });
+  const rs = await probeServerDate(slow.deps, { budgetMs: 6000 });
+  assert(rs.elapsedMs <= 6000 && rs.reason === 'no_samples', 'probe: all-timeout server returns inside budget');
+  const nod = fakeForeUp({ theta: 0, upMs: 1, procMs: 5, downMs: 1, noDate: true });
+  const rn = await probeServerDate(nod.deps, { budgetMs: 6000 });
+  assertEqual(rn.reason, 'no_date_header', 'probe: missing Date header is reported, stops after 2');
+  assertEqual(nod.calls(), 2, 'probe: missing Date header costs exactly two requests');
+})();
+
+{
+  // Poll telemetry -> send-time release bracket. ms = receive time rel. T=0.
+  const ev = [
+    { name: 'poll', course: 'red', ms: -40, rtt: 90, hit: false },   // sent -130
+    { name: 'poll', course: 'red', ms: 60, rtt: 120, hit: false },   // sent -60
+    { name: 'poll', course: 'red', ms: 300, rtt: 348, hit: true },   // sent -48
+    { name: 'poll', course: 'red', ms: 330, rtt: 360, hit: true, afterDetect: true }, // sent -30
+    { name: 'poll', course: 'green', ms: 10, rtt: 400, hit: true },
+  ];
+  assertDeepEqual(releaseSendBracket(ev, 'red'), { lastMissSentMs: -60, firstHitSentMs: -48, firstHitRecvMs: 300, polls: 4 },
+    'release bracket: latest-sent miss / earliest-sent hit');
+  const run = (firstHitMs: number, rtt: number, extra: Record<string, unknown>[] = []) => ({
+    timingBasis: 'server_release',
+    events: [...extra, { name: 'poll', course: 'red', ms: firstHitMs - rtt + 20, rtt: 80, hit: false }, // sent 60ms before the hit
+      { name: 'poll', course: 'red', ms: firstHitMs, rtt, hit: true }] as any[],
+  });
+  const stats = summarizeReleaseRuns([
+    run(272, 330),                                                     // first open send -58
+    run(291, 300, [{ name: 'clock_sync', offsetMs: 75, ntpMs: 45 }]),  // -9, normalized by -30 -> -39
+    { timingBasis: 'run_start', events: [{ name: 'poll', course: 'red', ms: 5, rtt: 5, hit: true }] as any[] },
+  ], 'red')!;
+  assertEqual(stats.n, 2, 'release stats: only scheduled drops count');
+  assertEqual(stats.latestFirstHitSentMs, -39, 'release stats: estimator bias removed via recorded NTP');
+  assertDeepEqual(planSpecOffsets([150, 450], stats), [0, 300], 'spec plan: never earlier than T+0, spacing kept');
+  assertDeepEqual(planSpecOffsets([150, 450], { ...stats, n: 1 }), [150, 450], 'spec plan: one drop is not enough data');
+  assertDeepEqual(planSpecOffsets([150, 450], { ...stats, latestFirstHitSentMs: 900 }), [400, 700], 'spec plan: capped at T+400');
+  assertEqual(planPreDropMs(stats), 208, 'pre-drop: earliest open send -58 -> lead 208ms');
+  assertEqual(planPreDropMs({ ...stats, openLowRuns: 1 }), 600, 'pre-drop: a drop open before our first poll widens to 600ms');
+  assertEqual(planPreDropMs({ ...stats, earliestFirstHitSentMs: -5000 }), 1000, 'pre-drop: bounded at 1000ms');
+  assertEqual(planPreDropMs(null), 200, 'pre-drop: no history keeps T-200');
+}
+
+// ════════════════════════════════════════════════════════════
 section('Turbo safety guards — production helpers');
+
+// Review fixes: clock fusion without NTP, and calibration uses the re-sync offset.
+{
+  const iv = { lo: 2422, hi: 2619, votes: 6, used: 6, minRttMs: 90 };
+  const noNtp = fuseClockOffset(null, iv);
+  assertEqual(noNtp.offsetMs, 2422, 'clock fusion: without NTP a tight ForeUp interval corrects a 2.4s-slow machine clock');
+  assertEqual(noNtp.source, 'foreup', 'clock fusion: no-NTP correction is labelled foreup');
+  const prior = fuseClockOffset(null, { lo: 20, hi: 180, votes: 4, used: 4, minRttMs: 80 }, 2, 80);
+  assertEqual(prior.offsetMs, 80, 'clock fusion: re-sync without NTP keeps a prior offset that ForeUp agrees with');
+  assertEqual(prior.source, 'prior', 'clock fusion: prior base is labelled');
+  assertEqual(fuseClockOffset(null, { lo: 900, hi: 1000, votes: 4, used: 4, minRttMs: 80 }, 2, 80).offsetMs, 80, 'clock fusion: prior is sanity-capped like NTP');
+  assertEqual(fuseClockOffset(30, iv).offsetMs, 30, 'clock fusion: a >500ms ForeUp disagreement with NTP is still refused');
+  const run = (resync: { name: string; offsetMs?: number; ntpMs?: number; timedOut?: boolean; keptMs?: number } | null) => ({
+    timingBasis: 'server_release',
+    events: [
+      { name: 'clock_sync', offsetMs: 80, ntpMs: 0 },
+      ...(resync ? [resync] : []),
+      { name: 'poll', course: 'red', ms: 100, rtt: 90, sentMs: 10, hit: false },
+      { name: 'poll', course: 'red', ms: 400, rtt: 300, sentMs: 100, hit: true },
+    ],
+  });
+  assertEqual(summarizeReleaseRuns([run({ name: 'clock_resync', offsetMs: 5, ntpMs: 5 })], 'red')?.latestFirstHitSentMs, 100, 'calibration: normalized with the re-sync offset the polls used');
+  assertEqual(summarizeReleaseRuns([run(null)], 'red')?.latestFirstHitSentMs, 20, 'calibration: falls back to the arm-time sync');
+  assertEqual(summarizeReleaseRuns([run({ name: 'clock_resync', timedOut: true, keptMs: 80 })], 'red')?.latestFirstHitSentMs, 20, 'calibration: a timed-out re-sync is ignored');
+}
+
+{
+  assertEqual(classifyTimesResponse(200, '[]').kind, 'empty', 'poll: pre-release empty array');
+  assertEqual(classifyTimesResponse(200, 'false').kind, 'empty', 'poll: legacy false');
+  assertEqual(classifyTimesResponse(200, '[{"time":"2026-08-09 08:27"}]').kind, 'times', 'poll: real sheet');
+  assertEqual(classifyTimesResponse(200, '{"success":false,"msg":"x"}').kind, 'rejected', 'poll: unauthenticated/wrong class is NOT "no times"');
+  assertEqual(classifyTimesResponse(429, '[]').kind, 'blocked', 'poll: WAF throttle');
+  assertEqual(classifyTimesResponse(200, '<html>blocked</html>').kind, 'blocked', 'poll: WAF HTML page');
+}
+
+{
+  assertEqual(pollPhase(-1001, 6, 12), null, 'poll phase: nothing before T-1000');
+  assertDeepEqual(pollPhase(-1000, 6, 12), { maxInFlight: 1, minGapMs: 100 }, 'poll phase: sentinel lane from T-1000');
+  assertDeepEqual(pollPhase(-350, 6, 12), { maxInFlight: 6, minGapMs: 15 }, 'poll phase: dense from T-350');
+  assertDeepEqual(pollPhase(399, 6, 30), { maxInFlight: 6, minGapMs: 30 }, 'poll phase: dense respects a wider stagger');
+  assertDeepEqual(pollPhase(400, 6, 12), { maxInFlight: 6, minGapMs: 50 }, 'poll phase: backs off after T+400');
+  assertEqual(poolWarmSockets(6, 2), 12, 'pool warm: one socket per first-wave lane');
+  assertEqual(poolWarmSockets(6, 3), 12, 'pool warm: capped');
+  assertEqual(poolWarmSockets(0, 2), 1, 'pool warm: at least one');
+}
+
+{
+  assertEqual(specRunMode({ spec: true, sheetAlreadyLive: true, specCount: 2, zeroDollarMode: false }), 'off', 'spec mode: live money run on a live sheet races real times');
+  assertEqual(specRunMode({ spec: true, sheetAlreadyLive: true, specCount: 2, zeroDollarMode: true }), 'live_sheet_test', 'spec mode: $0 live-sheet mechanism test kept');
+  assertEqual(specRunMode({ spec: true, sheetAlreadyLive: false, specCount: 2, zeroDollarMode: false }), 'drop', 'spec mode: drop night blind-fires');
+  assertEqual(specRunMode({ spec: true, sheetAlreadyLive: false, specCount: 0, zeroDollarMode: false }), 'off', 'spec mode: no prediction, no SPEC');
+  assertEqual(specRunMode({ spec: false, sheetAlreadyLive: false, specCount: 2, zeroDollarMode: false }), 'off', 'spec mode: flag off');
+}
+
+{
+  assertEqual(vultureRetryDelayMs(1), 20_000, 'vulture backoff: first retry 20s');
+  assertEqual(vultureRetryDelayMs(2), 40_000, 'vulture backoff: doubles');
+  assertEqual(vultureRetryDelayMs(9), 160_000, 'vulture backoff: capped at 160s');
+  assert(isSoftLimitRejection('{"success":false,"msg":"Invalid request"}'), 'soft limit: detected');
+  assert(!isSoftLimitRejection('Time not available'), 'soft limit: a contested slot is not a rate limit');
+}
+
+{
+  assertEqual(etDropTargetDate(Date.parse('2026-10-03T23:30:00Z')), '10-10-2026', 'drop date: EDT evening');
+  assertEqual(etDropTargetDate(Date.parse('2026-10-04T00:30:00Z')), '10-10-2026', 'drop date: UTC already next day, ET still drop day');
+  assertEqual(etDropTargetDate(Date.parse('2026-11-02T00:30:00Z')), '11-08-2026', 'drop date: EST after DST ends');
+  assertEqual(etDropTargetDate(Date.parse('2026-12-28T23:00:00Z')), '01-04-2027', 'drop date: year rollover');
+}
+
+{
+  const exp = { dateMdY: '08-09-2026', time24: '08:27' };
+  const loser = 'Date: 08-09-2026\nTime: 08:27 AM\nYour booking code is: 111111';
+  const winnerAuto = 'Date: 08-09-2026\nTime: 08:27 AM\nYour booking code is: 222222';
+  const resend = 'Date: 08-09-2026\nTime: 08:27 AM\nYour booking code is: 333333';
+  const other = 'Date: 08-09-2026\nTime: 08:18 AM\nYour booking code is: 999999';
+  assertEqual(pickBookingCode([loser, winnerAuto], exp), '111111', 'email ambiguity: a same date+time loser code can come first');
+  assertEqual(pickBookingCode([loser, winnerAuto], exp, new Set(['111111'])), '222222', 'email retry: rejected code skipped');
+  assertEqual(pickBookingCode([resend, loser, winnerAuto], exp, new Set(['111111', '222222'])), '333333', 'email retry: third candidate');
+  assertEqual(pickBookingCode([loser], exp, new Set(['111111'])), null, 'email retry: exhausted batch keeps waiting');
+  assertEqual(pickBookingCode([other], exp), null, 'email: a different time never matches');
+}
+
+{
+  const m = new EmailMonitor('nobody@example.com', 'x');
+  const c = (m as any).client;
+  let threw = false;
+  try { c.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })); } catch { threw = true; }
+  assert(!threw, 'imap safety: a socket error never becomes an uncaught exception');
+  assertEqual((m as any).connected, false, 'imap safety: errored session marked for reconnect');
+}
 
 {
   const exact = 'Bethpage Red Course   July 21, 2026\n8:27am';
@@ -1133,7 +1272,13 @@ section('Turbo race-policy wiring contract');
 
 {
   const turbo = fs.readFileSync('src/turbo.ts', 'utf8');
-  assert(turbo.includes('async function foreupServerOffset(maxMs = 3000)'), 'clock sync: sampling window survives a cold first request');
+  assert(turbo.includes('function foreupServerOffset(priorOffsetMs: number | null, budgetMs = 6000)'), 'clock sync: ForeUp probe is NTP-aimed and hard-bounded');
+  assert(turbo.includes('settleWithin<ClockSync | null>(syncClock(6000, CLOCK_OFFSET_MS).catch(() => null), Math.max(0, r - 9_000), null)'), 'clock sync: T-30 re-sync returns control by T-9s and keeps the prior offset as its base');
+  assert(turbo.includes("if (crashing) return 'manual_needed';"), 'crash safety: a crash cleanup and the charging click never overlap');
+  assert(turbo.includes('handedOffPages.has(p)'), 'crash safety: a hold handed to the human is never auto-released');
+  assert(turbo.includes('(ABORT_BEFORE_BOOK || TEST_PAYMENT) && !paymentSubmitted'), 'test modes: a checkout error releases the $0 hold');
+  assert(turbo.includes('const maxCodes = sameTimeElsewhere ? 3 : 1;'), 'checkout email: retries only when a look-alike code can exist');
+  assert(turbo.includes('CLOCK_OFFSET_MS = sync.clock.offsetMs;\n  anchorClock();'), 'clock sync: every adopted offset re-anchors the monotonic clock');
   assert(turbo.includes("const t0 = scheduledDrop ? releaseAt : pollStartedAt;"), 'race timing: scheduled drop uses fixed release epoch');
   assert(turbo.includes("if (run.timingBasis !== 'server_release') continue;"), 'race timing: legacy poll-relative telemetry excluded');
   assert(turbo.includes("const preferred = cfg.courses[0];"), 'spec priority: first configured course is the only blind-fire target');
@@ -1159,13 +1304,48 @@ section('Turbo race-policy wiring contract');
   assert(turbo.includes('fs.renameSync(tmpPath, finalPath);'), 'snapshots: atomic immutable capture write');
   assert(turbo.includes("saveSheetSnapshot(course, d, r, 'neighbor-scout');"), 'snapshots: read-only neighbor scouts are preserved');
   assert(turbo.includes("api.pollTimes(d, course, 'all')"), 'spec scout: all-time GET supplies a full-rate field anchor');
-  assert(turbo.includes('isWeekendDate(d) === targetWeekend'), 'spec scout: weekday/weekend fee classes are never mixed');
-  assert(turbo.includes('const scouts = [...snapshotScouts, ...liveScouts];'), 'spec scout: ranked drop captures beat adjacent inferred rows on collisions');
+  assert(turbo.includes('dayClassOf(d, SPEC_HOLIDAYS) === targetClass'), 'spec scout: weekday/weekend fee classes are never mixed');
+  assert(turbo.includes('const scouts = [...loadSheetSnapshots(course, date, library), ...liveScouts, inferred];'), 'spec scout: observed rows (drop captures first) beat inferred rows on collisions');
+  assert(turbo.includes('pickFullRateAnchor(library, course.key, date, SPEC_HOLIDAYS)'), 'spec scout: morning fees only come from a proven full-rate row');
+  assert(!turbo.includes('16 * 60'), 'spec scout: no clock-based twilight cutoff remains');
+  assert(turbo.includes('specShotTarget(cands, i, detectedSheets.get(key), (c) => c.t.time)'), 'spec strike: backups yield once the sheet is detected');
+  assert(turbo.includes('reportSpecAccuracy(course, times)'), 'spec check: every drop capture is diffed against the armed prediction');
   assert(turbo.includes('const courseKeys = [...new Set('), 'course actors: duplicate CLI/env course keys are deduplicated');
   assert(turbo.includes('Math.max(cfg.raceGraceMs, 1000)'), 'poll race: lower-priority detection leaves a full second for preferred Red');
   assert(turbo.includes(".filter((c) => !attempted.has(`${c.course.key}|${c.t.time}`))"), 'fallback race: already-attempted detected slots are not retried');
   assert(turbo.includes('missingSpecTemplateFields(cand.t)'), 'spec payload: incomplete predicted payloads are excluded before blind fire');
-  assert(turbo.includes("fetchTextWithTimeout(url, { headers: this.headers(), method: 'GET' }, timeoutMs)"), 'poll safety: every times request has a bounded header+body timeout');
+  assert(turbo.includes("fetchTextWithTimeout(this.timesUrl(date, course, tf, players), { headers: this.headers(), method: 'GET' }, timeoutMs)"), 'poll safety: every times request has a bounded header+body timeout');
+  assert(turbo.includes('api.pollTimesDetailed(date, course, 3000)'), 'poll safety: drop detector keeps a lane alive through a 3s server stall');
+  assert(turbo.includes('pollPhase(now() - t0, cfg.pollConcurrency, cfg.pollStaggerMs)'), 'poll schedule: release-relative sentinel + dense window');
+  assert(turbo.includes("preDropMs: 1000,"), 'poll schedule: sentinel lane starts at T-1000');
+  assert(turbo.includes('sentMs: sent - t0'), 'poll telemetry: release-relative send time recorded for calibration');
+  assert(turbo.includes('API detector unhealthy for'), 'detector: a blind (rejected/blocked) detector is loud before 7pm');
+  assert(turbo.includes('api.warmPool(sockets)') && turbo.includes('r <= 1500 && !poolWarmed'), 'pool: keep-alive sockets warmed at T-1.5s');
+  assert(turbo.includes('detectedP.catch(() => {});'), 'stream race: unawaited detector rejection is observed');
+  assert(turbo.includes("process.on('uncaughtException'") && turbo.includes("process.on('unhandledRejection'"), 'crash safety: process faults run cleanup + telemetry');
+  assert(turbo.includes('if (paymentSubmitted) {'), 'crash safety: nothing is released after PROCESS TRANSACTION');
+  assert(turbo.includes('const result = await completeBookingSafe('), 'checkout: throws become manual_needed, not crashes');
+  assert(turbo.includes('await email.ensureFreshBaseline(6000)') || turbo.includes('email.ensureFreshBaseline(6000)'), 'checkout email: bounded self-reconnecting baseline');
+  assert(turbo.includes('waitForBookingCode(codeTry === 0 ? 70_000 : 30_000, expectedEmail, triedCodes)'), 'checkout email: a rejected code is excluded and the next matching code tried');
+  assert(!/isVisible\(\{ timeout/.test(turbo), 'playwright: no ignored isVisible timeouts remain');
+  assert(turbo.includes("pBtn.waitFor({ state: 'visible', timeout: 3000 })"), 'money gate #2 waits for the in-modal players chip');
+  assert(turbo.includes("const specTest = specMode === 'live_sheet_test';"), 'spec: live-sheet single shot is $0-only');
+  assert(turbo.includes("process.env.TZ = 'America/New_York';"), 'turbo: drop math pinned to ET');
+  assert(turbo.includes('DATE CHECK:'), 'turbo: wrong-date arm is loud');
+  assert(turbo.includes('for (const k of raceAttempted) tries.set('), 'vulture: race-lost slots start backed off');
+  assert(turbo.includes('isSoftLimitRejection(lastHoldRejection)'), 'vulture: soft rate limit pauses holds');
+  const capture = turbo.slice(turbo.indexOf('async function captureDropSheets'), turbo.indexOf('// Predictions armed for this drop'));
+  assert(capture.includes("api.pollTimes(date, c, 'all')") && capture.includes("'drop-first-hit'"), 'capture-drop: saves the released sheet');
+  assert(!/holdViaBridge|specStrike|holdPhase|browserBook/.test(capture), 'capture-drop: read-only, never holds');
+  const pay = turbo.slice(turbo.indexOf('// 12. The charge.'), turbo.indexOf('if (AUTO_BOOK && !filled)'));
+  assert(pay.indexOf('paymentSubmitted = true') >= 0 && pay.indexOf('paymentSubmitted = true') < pay.indexOf("locator('a#submit').click()"), 'payment safety: flag set before the charging click');
+  const aws = fs.readFileSync('deploy/aws-setup.sh', 'utf8');
+  assert(aws.includes('rsync -az --ignore-existing') && aws.includes('logs/sheets/'), 'deploy: SPEC sheet library merged both ways without overwrite');
+  const uiSrc = fs.readFileSync('src/ui-server.ts', 'utf8');
+  const uiHtml = fs.readFileSync('static/turbo-ui.html', 'utf8');
+  assert(uiSrc.includes("turboFlags.push('--race');"), 'dashboard: race mode is explicit');
+  assert(uiSrc.includes('date: schedule.date ?? null'), 'dashboard: scheduled date visible');
+  assert(uiHtml.includes('if (!dateTouched) return undefined;'), 'dashboard date: untouched picker never freezes --date');
   assert(turbo.includes('return await consume(response);'), 'poll safety: abort timer remains active through response consumption');
   assert(/settleWithin(?:<DeleteResult>)?\(nativeDelete, 2500/.test(turbo), 'release safety: native DELETE fallback cannot hang settlement');
   assert(turbo.includes("const TEST_PAYMENT = process.argv.includes('--test-payment');"), 'payment test: dedicated rehearsal flag exists');

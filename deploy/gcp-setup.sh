@@ -76,6 +76,18 @@ gcloud compute scp --recurse --zone="$ZONE" --project="$PROJECT" --quiet \
   ~/bethpage-sniper/tsconfig.json ~/bethpage-sniper/.env ~/bethpage-sniper/auth \
   "$NAME":~/bethpage-sniper/
 
+# SPEC's sheet library both ways (unique immutable snapshot names — copying a
+# same-named file again is a no-op in content). Public tee-sheet rows only.
+echo "→ Merging the SPEC sheet library both ways"
+mkdir -p ~/bethpage-sniper/logs/sheets
+"${SSH[@]}" --command='mkdir -p ~/bethpage-sniper/logs/sheets'
+if compgen -G "$HOME/bethpage-sniper/logs/sheets/*.json" >/dev/null; then
+  gcloud compute scp --zone="$ZONE" --project="$PROJECT" --quiet \
+    ~/bethpage-sniper/logs/sheets/*.json "$NAME":~/bethpage-sniper/logs/sheets/
+fi
+gcloud compute scp --recurse --zone="$ZONE" --project="$PROJECT" --quiet \
+  "$NAME":~/bethpage-sniper/logs/sheets ~/bethpage-sniper/logs/ || echo "  (no remote sheets yet)"
+
 echo "→ npm install + Playwright Chromium (slow on e2-micro — several minutes)"
 "${SSH[@]}" --command='
 set -e

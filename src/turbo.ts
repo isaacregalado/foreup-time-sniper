@@ -47,8 +47,51 @@ import {
   firstModalIdentityMismatch,
   missingSpecTemplateFields,
   settleWithin,
+  classifyTimesResponse,
+  etDropTargetDate,
+  isSoftLimitRejection,
+  pollPhase,
+  poolWarmSockets,
+  specRunMode,
+  vultureRetryDelayMs,
   type ModalIdentityMismatch,
+  type PollKind,
 } from './turbo-guards';
+import {
+  fuseClockOffset,
+  pickNtpSample,
+  planPreDropMs,
+  planSpecOffsets,
+  probeServerDate,
+  summarizeReleaseRuns,
+  type ClockDecision,
+  type DateProbeResult,
+  type NtpSample,
+  type ReleaseStats,
+  type RunLike,
+} from './clock-sync';
+import {
+  dayClassOf,
+  isoDate,
+  latticePhase,
+  mdYDayNum,
+  mergeSpecTemplate,
+  pickFullRateAnchor,
+  predictWindowFromAnchor,
+  snapshotFileName,
+  specPayloadDiff,
+  specPredictTimes,
+  specScoutDates,
+  specShotIsLate,
+  specShotTarget,
+  type SheetRecord,
+  type SnapshotKind,
+  type SpecTime,
+} from './spec-template';
+
+// Every piece of drop math — the 7:00pm release epoch, D+7, weekend fee
+// class, log timestamps — is Eastern time, whatever the machine is set to.
+process.env.TZ = 'America/New_York';
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
@@ -125,6 +168,10 @@ function cliArg(name: string): string | undefined {
 }
 const argInt = (name: string, fb: number) => parseInt(cliArg(name) ?? String(fb), 10);
 const DRY_RUN = process.argv.includes('--dry-run');
+// Read-only drop capture (with --dry-run): wait for 7:00pm, then snapshot the
+// freshly released sheet — the only source of real MORNING rows and fees,
+// which is what lets SPEC price a weekend morning. Zero holds.
+const CAPTURE_DROP = process.argv.includes('--capture-drop');
 const ABORT_BEFORE_BOOK = process.argv.includes('--no-book'); // click tile + verify modal, then close at $0
 // Full $0 checkout rehearsal: consume the email code, validate the $5/player
 // amount, fill every card field, then explicitly DELETE the pending hold.
@@ -161,6 +208,8 @@ const SPEC_OFFSETS_MS: number[] = (cliArg('spec-fire') ?? process.env.SPEC_FIRE_
   .split(',').map((s) => parseInt(s.trim(), 10))
   .filter((n) => Number.isFinite(n) && n >= 0 && n <= 5000)
   .slice(0, 3); // ≤3 shots/course — rate-limit hygiene ("Invalid request" trips near 9 holds/5min)
+const SPEC_OFFSETS_EXPLICIT = (cliArg('spec-fire') ?? process.env.SPEC_FIRE_MS) !== undefined;
+let specPlanMs: number[] = SPEC_OFFSETS_MS; // calibrated in main() from release telemetry unless explicit
 const RACE = process.argv.includes('--race') || process.env.RACE === '1'; // pipelined poll across courses
 
 const courseKeys = [...new Set((cliArg('course') ?? process.env.COURSE ?? 'red,green')
@@ -205,7 +254,7 @@ const cfg = {
   minPlayers: argInt('min-players', parseInt(process.env.MIN_PLAYERS ?? process.env.PLAYERS ?? '4', 10)),
   holes: argInt('holes', parseInt(process.env.HOLES ?? '18', 10)),
   targetDate: cliArg('date') ?? process.env.TARGET_DATE ?? '',
-  preDropMs: 200,        // Start polling this far before T=0
+  preDropMs: 1000,       // Sentinel polling starts here; pollPhase() makes it dense from T-350
   pollIntervalMs: 50,    // Cycle time within the serial poll loop
   // ── Race mode tunables ──
   race: RACE,
@@ -325,11 +374,11 @@ function saveTelemetry() {
 }
 
 // ────────────────────────────────────────────────────────────
-// NTP cross-check — DNS is resolved before timing, then three SNTP samples
-// are medianed so a cold resolver or one delayed packet cannot skew T=0.
+// Clock sync. NTP (minimum-delay of 5 SNTP samples) is the base. ForeUp's
+// whole-second HTTP Date header can only bound ForeUp's clock to an interval
+// about one request-processing time wide, so it corrects NTP only when that
+// causal interval excludes NTP (pure math + bounded probe: src/clock-sync.ts).
 // ────────────────────────────────────────────────────────────
-interface NtpSample { offsetMs: number; rttMs: number }
-
 async function ntpSample(address: string): Promise<NtpSample | null> {
   return new Promise((resolve) => {
     const sock = dgram.createSocket('udp4');
@@ -356,7 +405,7 @@ async function ntpSample(address: string): Promise<NtpSample | null> {
   });
 }
 
-async function ntpOffset(samples = 3): Promise<number | null> {
+async function ntpOffset(samples = 5): Promise<NtpSample | null> {
   const address = await lookup('time.cloudflare.com', { family: 4 }).then((r) => r.address).catch(() => null);
   if (!address) return null;
   const got: NtpSample[] = [];
@@ -364,86 +413,65 @@ async function ntpOffset(samples = 3): Promise<number | null> {
     const s = await ntpSample(address);
     if (s) got.push(s);
   }
-  if (!got.length) return null;
-  const offsets = got.map((s) => s.offsetMs).sort((a, b) => a - b);
-  return offsets[Math.floor(offsets.length / 2)];
+  return pickNtpSample(got);
 }
 
-// ────────────────────────────────────────────────────────────
-// ForeUp server-clock sync — the drop fires on ForeUp's OWN clock, so
-// aligning to its HTTP `Date` header beats NTP (which only helps if ForeUp's
-// servers are perfectly disciplined; Date-header sync catches drift NTP
-// can't). `Date` is second-resolution, so we tick-boundary detect: sample
-// fast until the header's second value increments — that flip pins the
-// server's exact second boundary to within the old/new sample bracket.
-// ────────────────────────────────────────────────────────────
-
-interface ServerFlip { offsetMs: number; gapMs: number }
-
-/** The last-old and first-new response midpoints bracket the server's second
- * boundary. Their midpoint is less biased than treating the first-new request
- * as the boundary (which was systematically one request interval late). */
-function serverOffsetFromFlip(previousMidpointMs: number, currentMidpointMs: number, newSecondEpochMs: number): ServerFlip {
-  return {
-    offsetMs: Math.round(newSecondEpochMs - (previousMidpointMs + currentMidpointMs) / 2),
-    gapMs: Math.round(currentMidpointMs - previousMidpointMs),
-  };
-}
-
-/** Prefer the tightest transition brackets and median up to three of them.
- * Wide brackets are RTT outliers and carry hundreds of ms of uncertainty. */
-function selectServerOffset(flips: ServerFlip[]): number | null {
-  const ranked = flips.filter((f) => f.gapMs > 0 && f.gapMs <= 400).sort((a, b) => a.gapMs - b.gapMs);
-  if (!ranked.length) return null;
-  // Do not average a clean 160ms bracket with a 300ms outlier merely because
-  // only two flips were captured. Keep peers within 50ms of the best gap.
-  const tight = ranked.filter((f) => f.gapMs <= ranked[0].gapMs + 50).slice(0, 3);
-  const offsets = tight.map((f) => f.offsetMs).sort((a, b) => a - b);
-  if (offsets.length % 2) return offsets[Math.floor(offsets.length / 2)];
-  return Math.round((offsets[offsets.length / 2 - 1] + offsets[offsets.length / 2]) / 2);
-}
-
-// Warm once, then allow a full three-second observation window. This normally
-// captures 2-3 flips; it returns early after three to cap read-only traffic.
-async function foreupServerOffset(maxMs = 3000): Promise<number | null> {
+/** Hard-bounded ForeUp Date probe: never loops on a failing network, backs off
+ *  on errors, and cannot outlive budgetMs (~1 request/second). */
+function foreupServerOffset(priorOffsetMs: number | null, budgetMs = 6000): Promise<DateProbeResult> {
   const c = cfg.courses[0];
   const url = `${FOREUP}/index.php/api/booking/times?time=all&date=01-01-2030&holes=all&players=0&booking_class=${c.bookingClassId}&schedule_id=${c.scheduleId}&specials_only=0&api_key=no_limits`;
-  let deadline = Number.POSITIVE_INFINITY;
-  let prevSec: number | null = null;
-  let prevMidpoint: number | null = null;
-  const flips: ServerFlip[] = [];
-  while (Date.now() < deadline && flips.length < 3) {
-    const t0 = Date.now();
-    let dateHdr: string | null = null;
-    try { dateHdr = await fetchHeaderWithTimeout(url, { headers: { 'User-Agent': CHROME_UA }, method: 'GET' }, 800, 'date'); }
-    catch { continue; }
-    const t1 = Date.now();
-    if (!dateHdr) return null;
-    const sec = Date.parse(dateHdr); // second-resolution → the second's .000
-    if (Number.isNaN(sec)) return null;
-    const midpoint = (t0 + t1) / 2;
-    if (prevSec === null) deadline = Date.now() + maxMs; // cold warm-up does not consume the sample window
-    else if (prevMidpoint !== null && sec - prevSec === 1000) {
-      flips.push(serverOffsetFromFlip(prevMidpoint, midpoint, sec));
-    }
-    prevSec = sec;
-    prevMidpoint = midpoint;
-    // Sample tighter than the ½RTT so the flip is caught near its true instant.
-    await sleep(15);
-  }
-  return selectServerOffset(flips);
+  return probeServerDate({
+    fetchDate: (timeoutMs) => fetchHeaderWithTimeout(url, { headers: { 'User-Agent': CHROME_UA }, method: 'GET' }, timeoutMs, 'date'),
+    nowMs: () => Date.now(),
+    sleep,
+  }, { budgetMs, priorOffsetMs });
 }
 
-const CLOCK_MAX_DELTA_MS = 125;
-function trustedClockOffset(foreupMs: number | null, ntpMs: number | null): { offsetMs: number; source: 'foreup' | 'ntp' | 'local'; deltaMs: number | null } {
-  const deltaMs = foreupMs !== null && ntpMs !== null ? foreupMs - ntpMs : null;
-  if (foreupMs !== null && (deltaMs === null || Math.abs(deltaMs) <= CLOCK_MAX_DELTA_MS)) return { offsetMs: foreupMs, source: 'foreup', deltaMs };
-  if (ntpMs !== null) return { offsetMs: ntpMs, source: 'ntp', deltaMs };
-  return { offsetMs: 0, source: 'local', deltaMs };
+interface ClockSync { clock: ClockDecision; ntp: NtpSample | null; probe: DateProbeResult }
+async function syncClock(budgetMs = 6000, priorOffsetMs: number | null = null): Promise<ClockSync> {
+  const ntp = await ntpOffset().catch(() => null);
+  const probe = await foreupServerOffset(ntp?.offsetMs ?? priorOffsetMs, budgetMs)
+    .catch((): DateProbeResult => ({ samples: [], interval: null, requests: 0, errors: 1, reason: 'no_samples', elapsedMs: 0 }));
+  return { clock: fuseClockOffset(ntp?.offsetMs ?? null, probe.interval, 2, priorOffsetMs), ntp, probe };
+}
+function clockTelemetry(s: ClockSync): Record<string, unknown> {
+  return {
+    source: s.clock.source, offsetMs: s.clock.offsetMs, ntpMs: s.ntp?.offsetMs ?? null, ntpRttMs: s.ntp?.rttMs ?? null,
+    foreupLo: s.clock.foreupLo, foreupHi: s.clock.foreupHi, correctionMs: s.clock.correctionMs,
+    probe: {
+      reason: s.probe.reason, requests: s.probe.requests, errors: s.probe.errors, samples: s.probe.samples.length,
+      votes: s.probe.interval?.votes ?? 0, minRttMs: s.probe.interval?.minRttMs ?? null, elapsedMs: s.probe.elapsedMs,
+    },
+  };
+}
+function logClockSync(s: ClockSync, label = 'Clock offset'): void {
+  const ntp = s.ntp ? `NTP ${s.ntp.offsetMs}ms ±${Math.ceil(s.ntp.rttMs / 2)}` : 'NTP unavailable';
+  const fu = s.clock.foreupLo === null
+    ? `ForeUp probe ${s.probe.reason} (${s.probe.requests} req, ${s.probe.errors} err)`
+    : `ForeUp clock within [${s.clock.foreupLo}, ${s.clock.foreupHi}]ms (${s.probe.interval?.votes ?? 0} samples)`;
+  if (s.clock.source === 'ntp') log(s.clock.foreupLo === null ? '⚠' : '✓', `${label}: ${s.clock.offsetMs}ms (${ntp}; ${fu})`);
+  else if (s.clock.source === 'ntp+foreup') log('⚠', `${label}: ${s.clock.offsetMs}ms (${ntp} moved ${s.clock.correctionMs}ms — ${fu}: ForeUp's clock is off UTC)`);
+  else if (s.clock.source === 'foreup') log('⚠', `${label}: ${s.clock.offsetMs}ms (${ntp}; machine clock moved ${s.clock.correctionMs}ms — ${fu})`);
+  else if (s.clock.source === 'prior') log('⚠', `${label}: kept ${s.clock.offsetMs}ms (${ntp}; ${fu})`);
+  else if (s.clock.source === 'prior+foreup') log('⚠', `${label}: ${s.clock.offsetMs}ms (kept offset moved ${s.clock.correctionMs}ms — ${ntp}; ${fu})`);
+  else log('⚠', `${label}: machine clock (${ntp}; ${fu})`);
 }
 
 let CLOCK_OFFSET_MS = 0;
-const now = () => Date.now() + CLOCK_OFFSET_MS;
+// From each sync onward now() advances on the MONOTONIC clock: a later NTP
+// step/slew of the wall clock cannot move T=0, and monotonic drift over the
+// <=30s from the T-30 re-sync to release is ~1ms. A >2s forward wall jump
+// (sleep/wake, where monotonic time paused) re-anchors to the wall clock.
+let clockAnchor: { wallMs: number; monoMs: number } | null = null;
+const now = () => (clockAnchor
+  ? clockAnchor.wallMs + (performance.now() - clockAnchor.monoMs) + CLOCK_OFFSET_MS
+  : Date.now() + CLOCK_OFFSET_MS);
+function anchorClock(): void { clockAnchor = { wallMs: Date.now(), monoMs: performance.now() }; }
+/** Wall-clock movement relative to monotonic time since the last anchor. */
+function wallMinusMonoMs(): number {
+  return clockAnchor ? (Date.now() - clockAnchor.wallMs) - (performance.now() - clockAnchor.monoMs) : 0;
+}
 /** ForeUp-clock epoch of today's 7:00pm release. Offset changes alter now(),
  *  not this fixed wall-clock epoch, so a T-30s re-sync adjusts the wait safely. */
 function sevenPmEpoch(serverNowMs: number): number {
@@ -486,16 +514,23 @@ class ForeupClient {
     };
   }
 
-  async pollTimes(date: string, course: CourseCfg, timeFilter?: 'morning' | 'all', players = cfg.players): Promise<ApiTime[] | null> {
+  private timesUrl(date: string, course: CourseCfg, timeFilter: 'morning' | 'all', players: number): string {
+    return `${FOREUP}/index.php/api/booking/times?time=${timeFilter}&date=${date}&holes=${cfg.holes}&players=${players}&booking_class=${course.bookingClassId}&schedule_id=${course.scheduleId}&specials_only=0&api_key=no_limits`;
+  }
+
+  /** One times poll, classified: 'empty' is the only "not released yet". */
+  async pollTimesDetailed(
+    date: string, course: CourseCfg, timeoutMs: number, timeFilter?: 'morning' | 'all', players = cfg.players,
+  ): Promise<{ kind: PollKind; status: number; times: ApiTime[] | null }> {
     const tf = timeFilter ?? (cfg.windowEnd <= 12 * 60 ? 'morning' : 'all');
-    const url = `${FOREUP}/index.php/api/booking/times?time=${tf}&date=${date}&holes=${cfg.holes}&players=${players}&booking_class=${course.bookingClassId}&schedule_id=${course.scheduleId}&specials_only=0&api_key=no_limits`;
-    const timeoutMs = timeFilter ? 3000 : 1500; // scouts can be patient; the drop detector must free a saturated lane
-    const { text } = await fetchTextWithTimeout(url, { headers: this.headers(), method: 'GET' }, timeoutMs);
-    if (text === 'false' || !text) return null;
-    try {
-      const arr = JSON.parse(text);
-      return Array.isArray(arr) && arr.length > 0 ? arr : null;
-    } catch { return null; }
+    const { response, text } = await fetchTextWithTimeout(this.timesUrl(date, course, tf, players), { headers: this.headers(), method: 'GET' }, timeoutMs);
+    const r = classifyTimesResponse(response.status, text);
+    return { kind: r.kind, status: response.status, times: r.times as ApiTime[] | null };
+  }
+
+  async pollTimes(date: string, course: CourseCfg, timeFilter?: 'morning' | 'all', players = cfg.players): Promise<ApiTime[] | null> {
+    const r = await this.pollTimesDetailed(date, course, timeFilter ? 3000 : 1500, timeFilter, players);
+    return r.kind === 'times' ? r.times : null;
   }
 
   async preWarm(): Promise<void> {
@@ -504,6 +539,16 @@ class ForeupClient {
     await fetchAndDiscardWithTimeout(`${FOREUP}/index.php/api/booking/times?time=all&date=01-01-2030&holes=all&players=0&booking_class=${c.bookingClassId}&schedule_id=${c.scheduleId}&specials_only=0&api_key=no_limits`, {
       headers: this.headers(), method: 'GET',
     }, 3000).catch(() => {});
+  }
+
+  /** Open `sockets` keep-alive connections at once right before the drop, so
+   *  the first poll wave reuses warm TLS sockets instead of handshaking in
+   *  parallel at the most contended moment. Returns how many succeeded. */
+  async warmPool(sockets: number): Promise<number> {
+    const c = cfg.courses[0];
+    const url = `${FOREUP}/index.php/api/booking/times?time=all&date=01-01-2030&holes=all&players=0&booking_class=${c.bookingClassId}&schedule_id=${c.scheduleId}&specials_only=0&api_key=no_limits`;
+    const r = await Promise.allSettled(Array.from({ length: sockets }, () => fetchAndDiscardWithTimeout(url, { headers: this.headers(), method: 'GET' }, 1000)));
+    return r.filter((x) => x.status === 'fulfilled').length;
   }
 }
 
@@ -606,91 +651,10 @@ function cmpCandidate(a: Candidate, b: Candidate): number {
 // same teesheet. (Mirrored in tests.ts — keep in sync.)
 // ────────────────────────────────────────────────────────────
 
-/** "07-14-2026" → "2026-07-14" (the ApiTime.time date part). */
-function isoDate(mdY: string): string {
-  const [m, d, y] = mdY.split('-');
-  return `${y}-${m}-${d}`;
-}
-
-function isWeekendDate(mdY: string): boolean {
-  const [m, d, y] = mdY.split('-').map(Number);
-  const dow = new Date(y, m - 1, d).getDay();
-  return dow === 0 || dow === 6;
-}
-
-/** Scout-date preference order for a target: the other published dates
- *  (today..today+6 are always live regardless of the 7pm cutoff), same
- *  day-type first — weekend and weekday fee columns differ — then closest
- *  to the target. Pure ("today" injected) for tests. */
-function specScoutDates(targetMdY: string, todayMdY: string): string[] {
-  const [tm, td, ty] = todayMdY.split('-').map(Number);
-  const out: string[] = [];
-  // today+7 is live after the 7pm drop — pollTimes just returns null before.
-  for (let i = 0; i <= 7; i++) {
-    const d = new Date(ty, tm - 1, td + i);
-    const s = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}-${d.getFullYear()}`;
-    if (s !== targetMdY) out.push(s);
-  }
-  const tgtWknd = isWeekendDate(targetMdY);
-  const dayNum = (s: string) => { const [m, d, y] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
-  const tgtN = dayNum(targetMdY);
-  return out.sort((a, b) => {
-    const aw = isWeekendDate(a) === tgtWknd ? 0 : 1, bw = isWeekendDate(b) === tgtWknd ? 0 : 1;
-    if (aw !== bw) return aw - bw;
-    return Math.abs(dayNum(a) - tgtN) - Math.abs(dayNum(b) - tgtN);
-  });
-}
-
-/** Merge scouted sheets into one per-time-of-day template. First scout that
- *  has a time-of-day wins — pass scouts in preference order. Availability on
- *  the scout date is irrelevant; only the createPending fields matter. */
-function mergeSpecTemplate(scoutsInPreferenceOrder: ApiTime[][]): Map<string, ApiTime> {
-  const tpl = new Map<string, ApiTime>();
-  for (const times of scoutsInPreferenceOrder) {
-    for (const t of times ?? []) {
-      const hhmm = t.time.split(' ')[1];
-      if (hhmm && !tpl.has(hhmm)) tpl.set(hhmm, t);
-    }
-  }
-  return tpl;
-}
-
-/** Published mornings are sold out, but a same-day-type full-rate afternoon
- *  slot carries the same 16 createPending fields. Bethpage's observed grid is
- *  a 9-minute lattice. Infer only backwards from an anchor at/before 4:00pm;
- *  later anchors may be twilight-priced and are unsafe for a morning hold. */
-function inferSpecWindowFromFullRateAnchor(times: ApiTime[], windowStart: number, windowEnd: number): ApiTime[] {
-  const parsed = times.map((t) => {
-    const hhmm = t.time.split(' ')[1] ?? '';
-    const [hh, mm] = hhmm.split(':').map(Number);
-    return { t, min: hh * 60 + mm };
-  }).filter((x) => Number.isFinite(x.min));
-  // A partially sold morning (for example only 06:39 remains) is still a
-  // valid full-rate lattice anchor; fill its missing neighbors too. If the
-  // morning is gone, use the earliest post-window full-rate slot by 4pm.
-  const anchor = parsed.filter((x) => x.min >= windowStart && x.min <= windowEnd).sort((a, b) => a.min - b.min)[0]
-    ?? parsed.filter((x) => x.min > windowEnd && x.min <= 16 * 60).sort((a, b) => a.min - b.min)[0];
-  if (!anchor) return times;
-  const datePart = anchor.t.time.split(' ')[0];
-  const seen = new Set(parsed.map((x) => x.min));
-  const inferred: ApiTime[] = [];
-  for (let min = windowStart; min <= windowEnd; min++) {
-    if ((anchor.min - min) % 9 !== 0 || seen.has(min)) continue;
-    const hh = Math.floor(min / 60), mm = min % 60;
-    inferred.push({ ...anchor.t, time: `${datePart} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, spec_inferred: true });
-  }
-  return [...inferred, ...times];
-}
-
-/** Predict the target date's sheet: template slots with the date swapped in.
- *  available_spots becomes the hold's `players` (viewTime copies it), and the
- *  server rejects players > actual spots ("Time not available" — live-proven
- *  on a 1-spot leftover). So ask for exactly what we need: right on any slot
- *  with room for us, harmlessly rejected on any slot without. */
-function specPredictTimes(tpl: Map<string, ApiTime>, targetMdY: string, players: number): ApiTime[] {
-  const iso = isoDate(targetMdY);
-  return [...tpl.entries()].map(([hhmm, t]) => ({ ...t, time: `${iso} ${hhmm}`, available_spots: players }));
-}
+// Pure prediction helpers (scout order, fee-proof anchors, lattice, payload
+// checks) live in spec-template.ts so tests exercise the production code.
+const SPEC_HOLIDAYS: ReadonlySet<string> = new Set((process.env.SPEC_HOLIDAYS ?? '')
+  .split(',').map((s) => s.trim()).filter(Boolean)); // MM-DD-YYYY weekend-rate holidays, explicit opt-in
 
 function fmtTime(apiTime: string): string {
   const hhmm = apiTime.split(' ')[1] ?? '';
@@ -706,34 +670,52 @@ function fmtTime(apiTime: string): string {
 interface StopToken { stopped: boolean }
 
 /**
- * Pipelined poll: keep up to `pollConcurrency` requests in flight, launching a
- * new one every `pollStaggerMs`. Resolves the instant ANY poll returns a
- * non-empty list — so detection latency is ~one RTT past the drop, not
- * (RTT + pollInterval). Concurrency is capped low (default 6 per course):
- * this is a fast client, not a flood.
+ * Pipelined poll: keep up to `pollConcurrency` requests in flight on the
+ * release-relative schedule from pollPhase() (sentinel lane from T-1000,
+ * dense around the release). Resolves the instant ANY poll returns a
+ * non-empty list — detection latency is ~one RTT past the drop. Every poll is
+ * telemetered with its release-relative send time and classified result, so
+ * a blind detector (auth rejection, WAF block) is loud, not "no times yet".
  */
-function racePoll(api: ForeupClient, date: string, course: CourseCfg, stop: StopToken, maxPolls = 600): Promise<ApiTime[] | null> {
+function racePoll(
+  api: ForeupClient, date: string, course: CourseCfg, stop: StopToken, t0: number, maxPolls = 600,
+): Promise<{ times: ApiTime[] | null; kinds: Record<string, number>; launched: number }> {
   return new Promise((resolve) => {
     let done = false;
     let inflight = 0;
     let launched = 0;
-    const finish = (v: ApiTime[] | null) => { if (!done) { done = true; clearInterval(timer); resolve(v); } };
+    let lastLaunch = Number.NEGATIVE_INFINITY;
+    let warned = false;
+    const kinds: Record<string, number> = {};
+    const finish = (v: ApiTime[] | null) => { if (!done) { done = true; clearInterval(timer); resolve({ times: v, kinds, launched }); } };
     const timer = setInterval(() => {
       if (done) return;
       if (stop.stopped) { finish(null); return; }
       if (launched >= maxPolls) { if (inflight === 0) finish(null); return; }
-      if (inflight >= cfg.pollConcurrency) return;
+      const phase = pollPhase(now() - t0, cfg.pollConcurrency, cfg.pollStaggerMs);
+      if (!phase || inflight >= phase.maxInFlight || now() - lastLaunch < phase.minGapMs) return;
       launched++; inflight++;
-      const sent = Date.now();
-      api.pollTimes(date, course)
+      const sent = now();
+      lastLaunch = sent;
+      // 3s: a populated sheet takes ~0.3-0.45s at the drop; aborting at 1.5s
+      // would kill every lane right before delivery if ForeUp stalls.
+      api.pollTimesDetailed(date, course, 3000)
         .then((r) => {
           inflight--;
-          const hit = !!(r && r.length);
-          if (!done) tev('poll', { course: course.key, rtt: Date.now() - sent, hit });
-          if (hit) finish(r);
+          kinds[r.kind] = (kinds[r.kind] ?? 0) + 1;
+          tev('poll', { course: course.key, sentMs: sent - t0, rtt: now() - sent, kind: r.kind, status: r.status, hit: r.kind === 'times', afterDetect: done });
+          if ((r.kind === 'rejected' || r.kind === 'blocked') && !warned) {
+            warned = true;
+            log('⚠', `${course.name}: detector poll ${r.kind} (HTTP ${r.status}) — this is NOT "not released yet"; detection may be blind`);
+          }
+          if (r.kind === 'times' && r.times) finish(r.times);
         })
-        .catch(() => { inflight--; });
-    }, cfg.pollStaggerMs);
+        .catch((e) => {
+          inflight--;
+          kinds.error = (kinds.error ?? 0) + 1;
+          tev('poll', { course: course.key, sentMs: sent - t0, rtt: now() - sent, kind: 'error', err: (e as Error)?.name ?? 'error', afterDetect: done });
+        });
+    }, 4);
   });
 }
 
@@ -756,6 +738,19 @@ function historicalDetectStats(): { n: number; medianMs: number } | null {
     if (!vals.length) return null;
     vals.sort((a, b) => a - b);
     return { n: vals.length, medianMs: vals[Math.floor(vals.length / 2)] };
+  } catch { return null; }
+}
+
+/** Send-time release calibration for the first configured course from every
+ *  scheduled drop in race-log.jsonl (see summarizeReleaseRuns). */
+function historicalReleaseStats(courseKey: string): ReleaseStats | null {
+  try {
+    const runs: RunLike[] = [];
+    for (const line of fs.readFileSync(TELEMETRY_PATH, 'utf-8').split('\n')) {
+      if (!line) continue;
+      try { runs.push(JSON.parse(line)); } catch {}
+    }
+    return summarizeReleaseRuns(runs, courseKey);
   } catch { return null; }
 }
 
@@ -787,7 +782,8 @@ async function stagePage(page: Page, course: CourseCfg, date: string, players = 
   await page.goto(bookingUrl(course), { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await sleep(1500);
   const golfer = page.getByRole('button', { name: course.golferBtn });
-  if (await golfer.isVisible({ timeout: 3000 }).catch(() => false)) { await golfer.click(); await sleep(800); }
+  // isVisible() never waits (Playwright ignores its timeout) — waitFor does.
+  if (await golfer.waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false)) { await golfer.click(); await sleep(800); }
   await page.locator('#schedule_select').waitFor({ state: 'visible', timeout: 15_000 });
   // Players filter chip: matches how a human books and keeps only tiles with
   // enough spots visible. (The modal players button is still clicked later —
@@ -888,7 +884,7 @@ async function bootstrap(date: string): Promise<{ context: BrowserContext; pages
 
   const loginIfNeeded = async (): Promise<boolean> => {
     const emailField = page.getByPlaceholder('Email');
-    if (!(await emailField.isVisible({ timeout: 3000 }).catch(() => false))) return false;
+    if (!(await emailField.waitFor({ state: 'visible', timeout: 1500 }).then(() => true).catch(() => false))) return false;
     log('…', 'Logging in (session expired or first run)');
     await emailField.fill(cfg.foreupEmail);
     await page.getByPlaceholder('Password').fill(cfg.foreupPassword);
@@ -902,7 +898,7 @@ async function bootstrap(date: string): Promise<{ context: BrowserContext; pages
   await loginIfNeeded();
   for (let attempt = 0; attempt < 2; attempt++) {
     const golferBtn = page.getByRole('button', { name: cfg.courses[0].golferBtn });
-    if (await golferBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    if (await golferBtn.waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false)) {
       await golferBtn.click();
       await sleep(800);
     }
@@ -956,6 +952,10 @@ type BookResult =
 
 const pendingHoldIds = new WeakMap<Page, string>();
 const activeHoldPages = new Set<Page>();
+let paymentSubmitted = false; // set immediately before the only charging click
+let crashing = false;          // crashExit started — no new charging click may begin
+const handedOffPages = new Set<Page>(); // checkout handed to the human: a crash must not DELETE what they may be paying
+let lastHoldRejection = '';    // body of the most recent rejected hold (soft-limit detection)
 
 /** Close whatever modal is up, releasing our pending reservation (ForeUp
  *  removes the pending on modal close). The exact reservation ID captured
@@ -967,7 +967,7 @@ async function closeModal(page: Page): Promise<boolean> {
     ? page.waitForResponse((r) => r.request().method() === 'DELETE' && r.url().includes(`/pending_reservation/${id}`), { timeout: 2500 }).catch(() => null)
     : Promise.resolve(null);
   const close = page.locator('button.js-close-button');
-  if (await close.isVisible({ timeout: 1000 }).catch(() => false)) { await close.click().catch(() => {}); }
+  if (await close.isVisible().catch(() => false)) { await close.click().catch(() => {}); } // deliberate no-wait: hide + native DELETE follow
   else await page.evaluate(() => { (window as any).$?.('#modal')?.modal?.('hide'); }).catch(() => {});
   let released = false;
   const observed = await deleteResp;
@@ -1095,8 +1095,9 @@ async function holdViaBridge(page: Page, course: CourseCfg, cand: Candidate, t0:
   }
   if (lost) {
     const sent = resp.request().postData() ?? '';
+    lastHoldRejection = body.slice(0, 200) || String(resp.status());
     log('✗', `${course.name} ${tLabel}: hold rejected in ${now() - t0}ms (${body.slice(0, 100) || resp.status()}) — trying next candidate`);
-    tev('bridge_hold', { course: course.key, time: cand.t.time, result: 'hold_rejected', sent: sent.slice(0, 300), tPlusMs: now() - t0 });
+    tev('bridge_hold', { course: course.key, time: cand.t.time, result: 'hold_rejected', reason: body.slice(0, 120), sent: sent.slice(0, 300), tPlusMs: now() - t0 });
     return 'no_modal';
   }
   pendingHoldIds.set(page, reservationId);
@@ -1204,8 +1205,9 @@ async function holdViaTile(page: Page, course: CourseCfg, cand: Candidate, date:
     lost = true;
   }
   if (lost) {
+    lastHoldRejection = body.slice(0, 200) || String(resp.status());
     log('✗', `${course.name} ${tLabel}: hold rejected in ${now() - t0}ms (${body.slice(0, 100) || resp.status()}) — trying next candidate`);
-    tev('tile_click', { course: course.key, time: cand.t.time, result: 'hold_rejected', tPlusMs: now() - t0 });
+    tev('tile_click', { course: course.key, time: cand.t.time, result: 'hold_rejected', reason: body.slice(0, 120), tPlusMs: now() - t0 });
     return 'no_modal';
   }
   pendingHoldIds.set(page, reservationId);
@@ -1260,7 +1262,9 @@ async function completeBooking(
   //    filter-inherited highlight can show "4" while the model holds 1
   //    (live-observed: fee window said $5 instead of $20).
   const pBtn = page.locator(`.js-booking-players .js-booking-field-buttons a:text-is("${cand.players}")`).first();
-  if (!(await pBtn.isVisible({ timeout: 3000 }).catch(() => false))) {
+  // A slow modal paint under drop load must not discard a won hold: wait for
+  // the chip (isVisible() would answer instantly — its timeout is ignored).
+  if (!(await pBtn.waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false))) {
     log('✗', `MISMATCH: no "${cand.players}" players button in the modal. ABORTING this hold.`);
     tev('abort', { gate: 'players_button' });
     return await closeModal(page) ? 'abort_mismatch' : 'manual_needed';
@@ -1282,7 +1286,7 @@ async function completeBooking(
     // loser DELETE is verified, reset the mailbox baseline and request one
     // fresh winner code. EmailMonitor additionally requires this date+time
     // and scans newest-first; course is not present in ForeUp's email body.
-    const baselineReady = await email.resetBaseline().then(() => true).catch(() => false);
+    const baselineReady = await email.ensureFreshBaseline(6000).then(() => true).catch(() => false);
     const resend = page.locator('button.js-reservation-confirmation-resend-button');
     const resent = baselineReady && await resend.click().then(() => true).catch(() => false);
     if (!resent) {
@@ -1290,23 +1294,6 @@ async function completeBooking(
       return 'manual_needed';
     }
     log('…', 'Waiting for the fresh winner booking code via IMAP (matched by date + time)…');
-    const code = await email.waitForBookingCode(70_000, {
-      dateMdY: date,
-      time24: cand.t.time.split(' ')[1] ?? '',
-    }).catch(() => null);
-    if (!code) {
-      log('✗', 'No matching fresh code via IMAP — finish by hand: read the code from your email and type it in the browser.');
-      tev('code_timeout', {});
-      return 'manual_needed';
-    }
-    log('✓', `Code via IMAP: ***${code.slice(-2)}`);
-    tev('code_received', {});
-    const codeInput = page.locator('#reservation_confirmation_uid');
-    await codeInput.fill(code);
-    // ForeUp's Backbone model only picks the code up from a change event —
-    // fill() alone leaves the model empty (live-verified validation error).
-    await codeInput.dispatchEvent('change');
-    log('✓', 'Code entered in browser');
   }
 
   // 6. First "Book Time" — $0 with a booking fee: it opens Payment Method.
@@ -1324,14 +1311,42 @@ async function completeBooking(
     return 'ready';
   }
 
+  // The code email names date + time but not the course. When Red and Green
+  // both held the same slot, the released loser's code can arrive first and
+  // look identical, so a code ForeUp rejects is excluded and the next matching
+  // one is tried (bounded: 3 distinct codes). A wrong code is refused by
+  // ForeUp's own validation before Payment Method — it can never charge.
+  const expectedEmail = { dateMdY: date, time24: cand.t.time.split(' ')[1] ?? '' };
+  const triedCodes = new Set<string>();
+  const codeInput = page.locator('#reservation_confirmation_uid');
   let onPayment = false;
-  for (let attempt = 0; attempt < 2 && !onPayment; attempt++) {
-    await bookBtn.click().catch(() => {});
-    onPayment = await page.locator('#payment_selection').waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
-    if (!onPayment) {
+  // Only another hold at this same time (other course, or an earlier attempt)
+  // can produce a look-alike code; otherwise a stalled page is not a wrong
+  // code, and waiting for a second one would only delay the hand-off.
+  const sameTimeElsewhere = [...raceAttempted].some((k) => k.endsWith(`|${cand.t.time}`) && k !== `${cand.course.key}|${cand.t.time}`);
+  const maxCodes = sameTimeElsewhere ? 3 : 1;
+  for (let codeTry = 0; codeTry < maxCodes && !onPayment; codeTry++) {
+    const code = await email.waitForBookingCode(codeTry === 0 ? 70_000 : 30_000, expectedEmail, triedCodes).catch(() => null);
+    if (!code) break;
+    triedCodes.add(code);
+    log('✓', `Code via IMAP: ***${code.slice(-2)}${codeTry ? ` (candidate ${codeTry + 1}; the previous code was rejected)` : ''}`);
+    tev('code_received', { candidate: codeTry + 1 });
+    await codeInput.fill(code).catch(() => {});
+    // ForeUp's Backbone model only picks the code up from a change event —
+    // fill() alone leaves the model empty (live-verified validation error).
+    await codeInput.dispatchEvent('change').catch(() => {});
+    log('✓', 'Code entered in browser');
+    for (let attempt = 0; attempt < 2 && !onPayment; attempt++) {
+      await bookBtn.click().catch(() => {});
+      onPayment = await page.locator('#payment_selection').waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
       // Most likely the code didn't commit — refire change and retry once.
-      await page.locator('#reservation_confirmation_uid').dispatchEvent('change').catch(() => {});
+      if (!onPayment) await codeInput.dispatchEvent('change').catch(() => {});
     }
+  }
+  if (!triedCodes.size) {
+    log('✗', 'No matching fresh code via IMAP — finish by hand: read the code from your email and type it in the browser.');
+    tev('code_timeout', {});
+    return 'manual_needed';
   }
   if (!onPayment) {
     log('✗', 'Never reached the Payment Method screen — finish by hand in the browser (code, Book Time, Pay at Facility).');
@@ -1414,7 +1429,14 @@ async function completeBooking(
   // 12. The charge. Default: hand over. --auto-book: click it.
   if (AUTO_BOOK && filled) {
     log('💳', `AUTO-BOOK: clicking PROCESS TRANSACTION (${expected})…`);
-    await frame.locator('a#submit').click();
+    // From this instant the reservation may be PAID: nothing may auto-release
+    // it (crash cleanup included), and a click that rejects because the
+    // payment frame navigated away is verified below, never retried.
+    if (crashing) return 'manual_needed'; // same tick as the flag below: a crash cleanup and the charge never overlap
+    paymentSubmitted = true;
+    activeHoldPages.delete(page);
+    pendingHoldIds.delete(page);
+    await frame.locator('a#submit').click().catch((e) => log('⚠', `PROCESS TRANSACTION click reported: ${(e as Error).message} — verifying the outcome, NOT releasing`));
     const gone = await page.locator('#element_iframe').waitFor({ state: 'detached', timeout: 60_000 }).then(() => true).catch(() => false);
     if (!gone) {
       const err = ((await frame.locator('#divErrors').innerText().catch(() => '')) || '').trim();
@@ -1432,24 +1454,40 @@ async function completeBooking(
   return 'ready';
 }
 
+/** Checkout glitches (a detached frame, a selector timeout) become a FINISH
+ *  BY HAND verdict with the hold intact instead of a process crash. */
+async function completeBookingSafe(
+  page: Page, course: CourseCfg, cand: Candidate, email: EmailMonitor, date: string, t0: number,
+): Promise<BookResult> {
+  let result: BookResult;
+  try {
+    result = await completeBooking(page, course, cand, email, date, t0);
+  } catch (e) {
+    tev('checkout_error', { err: String((e as Error)?.message ?? e), paymentSubmitted });
+    if ((ABORT_BEFORE_BOOK || TEST_PAYMENT) && !paymentSubmitted) {
+      // A $0 mode promises a release, never a "finish by hand" toward payment.
+      log('✗', `Checkout automation threw (${(e as Error).message}) in a $0 test — releasing the hold`);
+      return await closeModal(page).catch(() => false) ? 'abort_mismatch' : 'manual_needed';
+    }
+    log('✗', `Checkout automation threw (${(e as Error).message}) — finish by hand in the browser; NOT retrying`);
+    result = 'manual_needed';
+  }
+  if (result === 'ready' || result === 'manual_needed') handedOffPages.add(page);
+  return result;
+}
+
 // Every detection snapshots the full times payload here — a captured drop
 // sheet is the only source that has the MORNING grid (published dates have
 // those slots booked), and last week's same-weekday sheet is the best
 // template for this week's target.
 const SHEETS_DIR = path.join(__dirname, '..', 'logs', 'sheets');
-type SnapshotKind = 'drop-first-hit' | 'preflight-live' | 'neighbor-scout';
 let snapshotSeq = 0;
-
-function snapshotFileName(courseKey: string, date: string, savedAt: string, seq: number, kind: SnapshotKind, pid = process.pid): string {
-  const stamp = savedAt.replace(/[^0-9]/g, '');
-  return `${courseKey}-${date}-${stamp}-${pid}-${String(seq).padStart(3, '0')}-${kind}.json`;
-}
 
 function saveSheetSnapshot(course: CourseCfg, date: string, times: ApiTime[], kind: SnapshotKind, tPlusMs: number | null = null): void {
   try {
     fs.mkdirSync(SHEETS_DIR, { recursive: true });
     const savedAt = new Date().toISOString();
-    const base = snapshotFileName(course.key, date, savedAt, snapshotSeq++, kind);
+    const base = snapshotFileName(course.key, date, savedAt, snapshotSeq++, kind, process.pid);
     const finalPath = path.join(SHEETS_DIR, base);
     const tmpPath = `${finalPath}.${process.pid}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify({
@@ -1464,63 +1502,90 @@ function saveSheetSnapshot(course: CourseCfg, date: string, times: ApiTime[], ki
   }
 }
 
-/** Saved sheets for a course, target's own date excluded (it must stay blind),
- *  same day-type first, then newest. */
-function loadSheetSnapshots(course: CourseCfg, targetMdY: string): ApiTime[][] {
+/** Every saved sheet for a course, any date — SPEC's fee-proof library.
+ *  Legacy files without metadata recover course/date from the file name. */
+function loadSheetRecords(courseKey: string): SheetRecord[] {
   try {
-    const tgtWknd = isWeekendDate(targetMdY);
     return fs.readdirSync(SHEETS_DIR)
-      .filter((f) => f.startsWith(`${course.key}-`) && f.endsWith('.json'))
-      .map((f) => {
-        try { return JSON.parse(fs.readFileSync(path.join(SHEETS_DIR, f), 'utf-8')); } catch { return null; }
+      .filter((f) => f.startsWith(`${courseKey}-`) && f.endsWith('.json'))
+      .map((f): SheetRecord | null => {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(SHEETS_DIR, f), 'utf-8'));
+          if (!Array.isArray(s?.times) || !s.times.length) return null;
+          const date = typeof s.date === 'string' ? s.date : f.slice(courseKey.length + 1, courseKey.length + 11);
+          if (!/^\d{2}-\d{2}-\d{4}$/.test(date)) return null;
+          return { course: courseKey, date, savedAt: typeof s.savedAt === 'string' ? s.savedAt : '', kind: s.kind, times: s.times };
+        } catch { return null; }
       })
-      .filter((s): s is { date: string; savedAt: string; kind?: SnapshotKind; times: ApiTime[] } =>
-        !!s?.times?.length && s.date !== targetMdY && isWeekendDate(s.date) === tgtWknd)
-      .sort((a, b) => {
-        const dow = (s: string) => { const [m, d, y] = s.split('-').map(Number); return new Date(y, m - 1, d).getDay(); };
-        const targetDow = dow(targetMdY);
-        const dateTier = (s: string) => dow(s) === targetDow ? 0 : isWeekendDate(s) === tgtWknd ? 1 : 2;
-        const aw = dateTier(a.date), bw = dateTier(b.date);
-        if (aw !== bw) return aw - bw;
-        const kindTier = (k?: SnapshotKind) => k === 'drop-first-hit' ? 0 : k === undefined ? 1 : k === 'preflight-live' ? 2 : 3;
-        const ak = kindTier(a.kind), bk = kindTier(b.kind);
-        if (ak !== bk) return ak - bk;
-        return a.savedAt.localeCompare(b.savedAt); // earliest capture is least censored by other holds
-      })
-      .map((s) => s.times);
+      .filter((r): r is SheetRecord => r !== null);
   } catch { return []; }
 }
 
-/** SPEC scout: build each course's predicted top in-window candidate from
- *  published neighbor dates + saved drop sheets. Cheap GETs, zero holds —
- *  runs pre-drop. Live scouts first (fresh fees), snapshots fill the gaps
- *  (mornings are booked out on every published date). */
+const SPEC_OBSERVED_MAX_AGE_DAYS = 45; // observed rows older than this may carry last season's fees
+
+/** Observed rows for the template: target's own date excluded (it must stay
+ *  blind), same day class only, exact weekday first, drop captures before
+ *  scouts, newest date first; repeat captures of one date keep the earliest
+ *  (least censored by other holds). */
+function loadSheetSnapshots(course: CourseCfg, targetMdY: string, library = loadSheetRecords(course.key)): SpecTime[][] {
+  const cls = dayClassOf(targetMdY, SPEC_HOLIDAYS);
+  const dow = (s: string) => new Date(mdYDayNum(s) * 864e5).getUTCDay();
+  const targetDow = dow(targetMdY);
+  const kindTier = (k?: SnapshotKind) => k === 'drop-first-hit' ? 0 : k === undefined ? 1 : k === 'preflight-live' ? 2 : 3;
+  return library
+    .filter((s) => s.date !== targetMdY && dayClassOf(s.date, SPEC_HOLIDAYS) === cls
+      && Math.abs(mdYDayNum(s.date) - mdYDayNum(targetMdY)) <= SPEC_OBSERVED_MAX_AGE_DAYS)
+    .sort((a, b) => {
+      const aw = dow(a.date) === targetDow ? 0 : 1, bw = dow(b.date) === targetDow ? 0 : 1;
+      if (aw !== bw) return aw - bw;
+      const ak = kindTier(a.kind), bk = kindTier(b.kind);
+      if (ak !== bk) return ak - bk;
+      const dd = mdYDayNum(b.date) - mdYDayNum(a.date);
+      return dd !== 0 ? dd : a.savedAt.localeCompare(b.savedAt);
+    })
+    .map((s) => s.times);
+}
+
+/** SPEC scout: build each course's predicted in-window candidates. Cheap
+ *  read-only GETs of the published neighbor dates (saved to the library),
+ *  then: observed rows first (drop captures carry real morning fees), and the
+ *  9-minute lattice filled in from a PROVEN full-rate anchor — never from a
+ *  twilight-priced afternoon row. */
 async function buildSpecCandidates(api: ForeupClient, date: string): Promise<Map<string, Candidate[]>> {
   const t = new Date();
   const todayMdY = `${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}-${t.getFullYear()}`;
-  const dates = specScoutDates(date, todayMdY);
-  const targetWeekend = isWeekendDate(date);
+  const dates = specScoutDates(date, todayMdY, SPEC_HOLIDAYS);
+  const targetClass = dayClassOf(date, SPEC_HOLIDAYS);
   const out = new Map<string, Candidate[]>();
   for (const course of cfg.courses) {
     const liveScouts: ApiTime[][] = [];
     for (const d of dates) {
       const r = await api.pollTimes(d, course, 'all').catch(() => null);
       if (r?.length) {
-        saveSheetSnapshot(course, d, r, 'neighbor-scout');
-        if (isWeekendDate(d) === targetWeekend) liveScouts.push(inferSpecWindowFromFullRateAnchor(r, cfg.windowStart, cfg.windowEnd));
+        saveSheetSnapshot(course, d, r, 'neighbor-scout'); // synchronous: the library below already includes it
+        if (dayClassOf(d, SPEC_HOLIDAYS) === targetClass) liveScouts.push(r);
       }
     }
-    // Exact-weekday drop captures are the least censored and loader-ranked;
-    // let them define colliding times before adjacent live inference fills gaps.
-    const snapshotScouts = loadSheetSnapshots(course, date)
-      .map((times) => inferSpecWindowFromFullRateAnchor(times, cfg.windowStart, cfg.windowEnd));
-    const scouts = [...snapshotScouts, ...liveScouts];
+    const library = loadSheetRecords(course.key);
+    const { anchor, reason } = pickFullRateAnchor(library, course.key, date, SPEC_HOLIDAYS);
+    const phase = latticePhase(library, course.key);
+    const inferred = anchor ? predictWindowFromAnchor(anchor, phase, cfg.windowStart, cfg.windowEnd) : [];
+    // Observed rows (exact-weekday drop captures first) beat inferred rows on collisions.
+    const scouts = [...loadSheetSnapshots(course, date, library), ...liveScouts, inferred];
     const tpl = mergeSpecTemplate(scouts);
+    if (anchor) {
+      log('ℹ', `SPEC fee proof ${course.name}: ${anchor.evidence} row ${anchor.date} ${anchor.t.time.split(' ')[1]} green_fee=${anchor.t.green_fee}${phase === null ? ' (lattice phase unknown — no inference)' : ''}`);
+    }
     if (tpl.size) {
       const keys = [...tpl.keys()].sort();
       log('ℹ', `SPEC template ${course.name}: ${tpl.size} times-of-day (${keys[0]}–${keys[keys.length - 1]}) from ${scouts.length} sheet(s)`);
     }
-    const cands = rankCandidates(specPredictTimes(tpl, date, cfg.players), course).filter((c) => c.inWindow);
+    tev('spec_anchor', {
+      course: course.key, evidence: anchor?.evidence ?? null,
+      source: anchor ? `${anchor.date} ${anchor.t.time.split(' ')[1]}` : null,
+      greenFee: anchor?.t.green_fee ?? null, phase, reason: reason || null,
+    });
+    const cands = rankCandidates(specPredictTimes(tpl, date, cfg.players, cfg.holes), course).filter((c) => c.inWindow);
     const invalid = cands.map((cand) => ({ cand, missing: missingSpecTemplateFields(cand.t) }))
       .filter((x) => x.missing.length > 0);
     const valid = cands.filter((cand) => missingSpecTemplateFields(cand.t).length === 0);
@@ -1537,22 +1602,65 @@ async function buildSpecCandidates(api: ForeupClient, date: string): Promise<Map
       log('⚠', `SPEC ${course.name}: excluded ${invalid.length} incomplete prediction(s), missing ${fields.join(', ')}`);
     }
     if (!valid.length) {
-      log('⚠', `SPEC: no in-window slot predictable for ${course.name} — spec disabled for it`);
+      log('⚠', `SPEC: no in-window slot predictable for ${course.name} — ${reason || 'no in-window template rows'}; spec disabled for it`);
       continue;
     }
     const ranked = valid.slice(0, SPEC_OFFSETS_MS.length);
     out.set(course.key, ranked);
-    log('✓', `SPEC candidates ${course.name}: ${ranked.map((c, i) => `${fmtTime(c.t.time)}@T+${SPEC_OFFSETS_MS[i]}ms`).join(', ')}`);
+    log('✓', `SPEC target ${course.name}: ${fmtTime(ranked[0].t.time)} @T+${specPlanMs.join('/')}ms (backup shots re-aim it only while still blind)`);
   }
   return out;
 }
 
-function planSpecShots(cands: Candidate[], offsets: number[]): Array<{ cand: Candidate; scheduledOffsetMs: number }> {
-  return cands.slice(0, offsets.length).map((cand, i) => ({ cand, scheduledOffsetMs: offsets[i] }));
+/** --dry-run --capture-drop: read-only. Waits for the 7:00pm release and
+ *  saves the first non-empty 'all' sheet per course (morning rows + the same
+ *  sheet's twilight step) as a drop-first-hit snapshot. One GET per pending
+ *  course every 250ms for at most 10s — far below the race poller. Never
+ *  holds. Run it on a night you are NOT racing (e.g. Saturday for the
+ *  weekend fee profile). */
+async function captureDropSheets(api: ForeupClient, date: string, sheetAlreadyLive: boolean): Promise<void> {
+  if (sheetAlreadyLive) { log('⚠', `CAPTURE: ${date} is already live — nothing new to capture at 7pm`); return; }
+  const releaseAt = sevenPmEpoch(now());
+  const lead = releaseAt - now();
+  if (lead <= 0 || lead > 15 * 60_000) { log('⚠', 'CAPTURE: start within 15 minutes before 7:00pm — skipped'); return; }
+  log('…', `CAPTURE: waiting ${Math.ceil(lead / 1000)}s for the ${date} release (read-only, zero holds)`);
+  while (now() < releaseAt + 300) await sleep(Math.min(1000, Math.max(5, releaseAt + 300 - now())));
+  const pending = new Set(cfg.courses.map((c) => c.key));
+  for (let i = 0; i < 40 && pending.size; i++) {
+    await Promise.all(cfg.courses.filter((c) => pending.has(c.key)).map(async (c) => {
+      const rows = await api.pollTimes(date, c, 'all').catch(() => null);
+      if (!rows?.length) return;
+      pending.delete(c.key);
+      saveSheetSnapshot(c, date, rows, 'drop-first-hit', now() - releaseAt);
+      log('✓', `CAPTURE ${c.name}: ${rows.length} rows at T+${now() - releaseAt}ms (${rows[0].time.split(' ')[1]}–${rows[rows.length - 1].time.split(' ')[1]})`);
+      tev('capture', { course: c.key, rows: rows.length, tPlusMs: now() - releaseAt });
+    }));
+    if (pending.size) await sleep(250);
+  }
+  if (pending.size) log('⚠', `CAPTURE: no sheet within 10s for ${[...pending].join(', ')}`);
 }
 
-function specShotIsLate(actualOffsetMs: number, scheduledOffsetMs: number, toleranceMs = 150): boolean {
-  return actualOffsetMs > scheduledOffsetMs + toleranceMs;
+// Predictions armed for this drop, checked against the real first sheet.
+let specPlanned = new Map<string, Candidate[]>();
+// First detected sheet per course: SPEC stops blind-firing once it exists.
+const detectedSheets = new Map<string, Set<string>>();
+// Every slot the drop race already spent a hold on (vulture backs off them).
+const raceAttempted = new Set<string>();
+
+/** Diff every armed prediction against the real first drop sheet so fee or
+ *  lattice drift shows up after one drop instead of weeks of silent misses.
+ *  Called off the hot path (setImmediate); the log line is deferred too. */
+function reportSpecAccuracy(course: CourseCfg, times: ApiTime[]): void {
+  const planned = specPlanned.get(course.key);
+  if (!planned?.length) return;
+  const byTime = new Map(times.map((t) => [t.time, t]));
+  const bad: string[] = [];
+  for (const c of planned) {
+    const diff = specPayloadDiff(c.t, byTime.get(c.t.time));
+    tev('spec_payload_check', { course: course.key, time: c.t.time, ok: diff.length === 0, diff, evidence: c.t.spec_evidence ?? 'observed' });
+    if (diff.length) bad.push(`${fmtTime(c.t.time)}: ${diff.join(', ')}`);
+  }
+  if (bad.length) setTimeout(() => log('⚠', `SPEC check ${course.name}: prediction ≠ real sheet (${bad.join('; ')}) — review the template before the next drop`), 5000);
 }
 
 interface HeldAttempt {
@@ -1565,10 +1673,11 @@ interface HeldAttempt {
 
 type HoldRunResult = { result: BookResult | 'exhausted'; cand?: Candidate };
 
-/** SPEC strike: per course, one ranked candidate per offset until one lands or
- *  the plan runs out. No tile fallback (pre-flip there is no tile). The next
- *  shot only runs after the previous response and is skipped if that made its
- *  fixed release-relative deadline stale. */
+/** SPEC strike: per course, up to one shot per offset until one lands. No
+ *  tile fallback (pre-flip there is no tile). The next shot only runs after
+ *  the previous response, is skipped if that made its release-relative
+ *  deadline stale, and yields to the informed detect walk once any poll has
+ *  seen the sheet (specShotTarget). */
 async function specStrike(
   pages: Map<string, Page>, specCands: Map<string, Candidate[]>, date: string, t0: number, offsets: number[],
 ): Promise<HeldAttempt[]> {
@@ -1577,17 +1686,26 @@ async function specStrike(
   await Promise.all([...specCands.entries()].map(async ([key, cands]) => {
     const page = pages.get(key);
     if (!page) return;
-    for (const { cand, scheduledOffsetMs: off } of planSpecShots(cands, offsets)) {
+    for (let i = 0; i < Math.min(offsets.length, 3); i++) {
+      const off = offsets[i];
       if (stop.stopped) return;
-      const dt = t0 + off - now();
-      if (dt > 0) await sleep(dt);
+      // Wake early if this course's sheet is detected while waiting: the shot
+      // then fires immediately if the sheet lists it, or yields to the detect
+      // walk — never parks Red's informed hold until the fixed offset.
+      while (t0 + off - now() > 0 && !detectedSheets.has(key) && !stop.stopped) await sleep(Math.min(5, t0 + off - now()));
       if (stop.stopped) return;
+      const cand = specShotTarget(cands, i, detectedSheets.get(key), (c) => c.t.time);
+      if (!cand) {
+        tev('spec_shot_yield', { course: key, shot: i, scheduledOffsetMs: off, actualOffsetMs: now() - t0 });
+        return; // the detected sheet is authoritative now — don't park the detect walk behind a blind shot
+      }
       const actualOffsetMs = now() - t0;
       if (specShotIsLate(actualOffsetMs, off)) {
         tev('spec_shot_skipped', { course: key, time: cand.t.time, scheduledOffsetMs: off, actualOffsetMs, lateByMs: actualOffsetMs - off });
         continue; // never turn a fixed-offset backup into a seconds-late extra hold
       }
-      tev('spec_shot', { course: key, time: cand.t.time, scheduledOffsetMs: off, actualOffsetMs, lateByMs: actualOffsetMs - off });
+      tev('spec_shot', { course: key, time: cand.t.time, shot: i, scheduledOffsetMs: off, actualOffsetMs, lateByMs: actualOffsetMs - off });
+      raceAttempted.add(`${key}|${cand.t.time}`);
       // SPEC only needs the POST result on the hot path. Modal rendering is
       // confirmed after all already-in-flight course attempts settle.
       const r = await holdViaBridge(page, cand.course, cand, t0);
@@ -1609,7 +1727,7 @@ async function browserBook(
   const held = await holdPhase(page, course, cand, date, t0);
   if (held === 'held_uncertain') return 'manual_needed';
   if (held !== 'held') return held as BookResult;
-  return completeBooking(page, course, cand, email, date, t0);
+  return completeBookingSafe(page, course, cand, email, date, t0);
 }
 
 /** Resolve ForeUp's async modal after a POST-level success. If the response
@@ -1713,7 +1831,7 @@ async function finalizeHeldAttempts(
   }
   await win.page.bringToFront().catch(() => {});
   log('🏆', `Completing ${win.source === 'spec' ? 'SPEC ' : ''}${win.cand.course.name} ${fmtTime(win.cand.t.time)} (T+${now() - t0}ms)`);
-  const result = await completeBooking(win.page, win.cand.course, win.cand, email, date, t0);
+  const result = await completeBookingSafe(win.page, win.cand.course, win.cand, email, date, t0);
   if (result === 'ready' || result === 'booked' || result === 'test_passed' || result === 'manual_needed') return { result, cand: win.cand };
   return { result: 'exhausted', abortedCandidate: win.cand };
 }
@@ -1750,6 +1868,7 @@ async function attemptCandidates(
       if (priority >= bestHeldPriority) return;
       let r: HoldOutcome;
       try {
+        raceAttempted.add(`${cand.course.key}|${cand.t.time}`);
         r = await holdPhase(page, cand.course, cand, date, t0);
       } catch (e) {
         const message = `${cand.course.name} ${fmtTime(cand.t.time)} hold walk failed: ${(e as Error).message}`;
@@ -1797,11 +1916,15 @@ async function raceDetectAndHold(
   let pollStopTimer: ReturnType<typeof setTimeout> | null = null;
 
   const detect = async (course: CourseCfg, priority: number): Promise<Candidate[]> => {
-    const times = await racePoll(api, date, course, pollStop);
-    if (!times) return [];
+    const { times, kinds, launched } = await racePoll(api, date, course, pollStop, t0);
+    if (!times) {
+      if (!pollStop.stopped || kinds.rejected || kinds.blocked) log('✗', `${course.name}: no times after ${launched} polls (${JSON.stringify(kinds)})`);
+      return [];
+    }
+    if (!detectedSheets.has(course.key)) detectedSheets.set(course.key, new Set(times.map((t) => t.time)));
     tev('detected', { course: course.key, count: times.length });
     log('⚡', `${course.name}: ${times.length} times (T+${now() - t0}ms)`);
-    setImmediate(() => saveSheetSnapshot(course, date, times, 'drop-first-hit', now() - t0));
+    setImmediate(() => { saveSheetSnapshot(course, date, times, 'drop-first-hit', now() - t0); reportSpecAccuracy(course, times); });
     const list = rankCandidates(times, course);
     if (!list.length) log('✗', `${course.name}: no bookable slots inside the configured cutoff`);
     detected.push(...list);
@@ -1820,6 +1943,7 @@ async function raceDetectAndHold(
     const page = pages.get(course.key);
     if (!page) return;
     const detectedP = detect(course, priority); // starts immediately for every course
+    detectedP.catch(() => {}); // observed even when a SPEC hold returns before it is awaited
 
     if (priority === 0 && specP) {
       try {
@@ -1843,6 +1967,7 @@ async function raceDetectAndHold(
       let r: HoldOutcome;
       try {
         attempted.add(`${cand.course.key}|${cand.t.time}`);
+        raceAttempted.add(`${cand.course.key}|${cand.t.time}`);
         r = await holdPhase(page, course, cand, date, t0);
       } catch (e) {
         unsafe = { message: `${course.name} hold actor failed: ${(e as Error).message}`, page, cand };
@@ -1921,7 +2046,12 @@ async function vultureHunt(
     log('✓', `Recovery pages ready for ${cfg.minPlayers}–${cfg.players} players`);
   }
 
-  const lastTry = new Map<string, number>();
+  // Per-slot backoff (vultureRetryDelayMs). Slots the drop race already lost
+  // start backed off instead of being re-held the instant the vulture starts.
+  const tries = new Map<string, { at: number; n: number }>();
+  for (const k of raceAttempted) tries.set(`${k}|${cfg.players}`, { at: now(), n: 1 });
+  const holdGapMs = Math.max(0, Number(process.env.VULTURE_HOLD_GAP_MS ?? 2500));
+  let nextHoldAt = 0;
   let lastLog = 0;
   let nextEmailKeepAlive = now() + 5 * 60_000;
   while (now() < deadline) {
@@ -1939,16 +2069,18 @@ async function vultureHunt(
       if (times) cands.push(...rankCandidates(times, course, cfg.minPlayers, cfg.players));
     }
     const fresh = cands.sort(cmpCandidate).filter((c) => {
-      const key = `${c.course.key}|${c.t.time}|${c.players}`;
-      return now() - (lastTry.get(key) ?? 0) > 20_000;
+      const t = tries.get(`${c.course.key}|${c.t.time}|${c.players}`);
+      return !t || now() - t.at > vultureRetryDelayMs(t.n);
     });
-    if (fresh.length) {
+    if (fresh.length && now() >= nextHoldAt) {
       const target = fresh[0]; // browser is serial — one deliberate attempt at a time
+      const key = `${target.course.key}|${target.t.time}|${target.players}`;
       if (now() - lastLog > 10_000) {
         log('🎯', `Vulture: trying ${fmtTime(target.t.time)} ${target.course.key} for ${target.players} players (T+${Math.round((now() - t0) / 1000)}s)`);
         lastLog = now();
       }
-      lastTry.set(`${target.course.key}|${target.t.time}|${target.players}`, now());
+      tries.set(key, { at: now(), n: (tries.get(key)?.n ?? 0) + 1 });
+      lastHoldRejection = '';
       const page = pages.get(target.course.key);
       if (page) {
         const result = await browserBook(page, target.course, target, email, date, t0);
@@ -1956,6 +2088,12 @@ async function vultureHunt(
           tev('vulture_success', { time: target.t.time, tPlusMs: now() - t0 });
           return { result, cand: target };
         }
+      }
+      nextHoldAt = now() + holdGapMs;
+      if (isSoftLimitRejection(lastHoldRejection)) {
+        log('⚠', 'Hold rejected "Invalid request" — likely ForeUp\'s soft rate limit; pausing vulture holds for 60s');
+        tev('soft_limit', { body: lastHoldRejection.slice(0, 120) });
+        nextHoldAt = now() + 60_000;
       }
     }
     await sleep(Math.min(cfg.vulturePollMs, Math.max(0, deadline - now())));
@@ -1977,6 +2115,16 @@ async function main() {
   console.log(`  Players:   ${cfg.players}${cfg.minPlayers < cfg.players ? ` preferred; ${cfg.minPlayers} accepted during recovery` : ''}`);
   console.log(`  Card:      ${cfg.feeCard.number ? `…${cfg.feeCard.number.slice(-4)} will be pre-filled` : 'not in .env — you type it at the end'}\n`);
 
+  // A date that is not tonight's drop date, armed shortly before 7pm, can
+  // never race the release (stale dashboard tab, 'tomorrow' auto-arm with a
+  // frozen date). Say so loudly instead of polling a sheet that won't change.
+  const tonightDrop = etDropTargetDate(Date.now());
+  const toDrop = msUntil7pm();
+  if (cfg.targetDate && cfg.targetDate !== tonightDrop && toDrop > 0 && toDrop < 45 * 60_000) {
+    log('⚠', `DATE CHECK: --date ${cfg.targetDate} is NOT tonight's drop date ${tonightDrop} — this run will not race the 7:00pm release`);
+    tev('date_mismatch', { requested: cfg.targetDate, dropDate: tonightDrop });
+  }
+
   // Keep the Mac awake for the whole run — a 6:58pm sleep kills everything.
   // -w ties caffeinate's lifetime to this process. Must be fully detached
   // (no stdio pipes): piped stdio would keep OUR event loop alive waiting on
@@ -1989,26 +2137,27 @@ async function main() {
   if (detStats) {
     log('ℹ', `History: median detection +${detStats.medianMs}ms after server release across ${detStats.n} drop${detStats.n > 1 ? 's' : ''}`);
   }
+  const relStats = historicalReleaseStats(cfg.courses[0].key);
+  const specOffsets = SPEC_OFFSETS_EXPLICIT ? SPEC_OFFSETS_MS : planSpecOffsets(SPEC_OFFSETS_MS, relStats);
+  specPlanMs = specOffsets;
+  const preDropMs = planPreDropMs(relStats, cfg.preDropMs);
+  if (relStats) {
+    log('ℹ', `Release calibration ${cfg.courses[0].name} (${relStats.n} drop${relStats.n > 1 ? 's' : ''}): first open send T${relStats.earliestFirstHitSentMs >= 0 ? '+' : ''}${relStats.earliestFirstHitSentMs}…T${relStats.latestFirstHitSentMs >= 0 ? '+' : ''}${relStats.latestFirstHitSentMs}ms → SPEC T+${specOffsets.join('/')}ms${SPEC_OFFSETS_EXPLICIT ? ' (explicit)' : ''}, polling from T-${preDropMs}ms`);
+    tev('release_calibration', { ...relStats, specOffsets, preDropMs, explicit: SPEC_OFFSETS_EXPLICIT });
+  }
 
   // ── Setup ─────────────────────────────────────────────
   log('…', 'Browser bootstrap');
   const { context, pages } = await bootstrap(date);
 
-  // Server-clock sync first (the drop fires on ForeUp's clock), NTP as a
-  // sanity cross-check + fallback if the Date-header probe fails.
-  log('…', 'Clock sync (ForeUp server clock)');
-  const [srv, ntp] = await Promise.all([foreupServerOffset(), ntpOffset()]);
-  const clock = trustedClockOffset(srv, ntp);
-  CLOCK_OFFSET_MS = clock.offsetMs;
-  if (clock.source === 'foreup') {
-    log('✓', `Clock offset: ${clock.offsetMs}ms (ForeUp server clock; NTP says ${ntp ?? 'unavailable'}ms${clock.deltaMs === null ? '' : `, Δ${clock.deltaMs}ms`})`);
-  } else if (clock.source === 'ntp') {
-    const why = srv === null ? 'server-clock probe failed' : `ForeUp/NTP disagreement Δ${clock.deltaMs}ms`;
-    log('⚠', `Clock offset: ${clock.offsetMs}ms (NTP fallback — ${why})`);
-  } else {
-    log('⚠', 'Clock sync unavailable — using the machine clock');
-  }
-  tev('clock_sync', { source: clock.source, offsetMs: clock.offsetMs, foreupMs: srv, ntpMs: ntp, deltaMs: clock.deltaMs });
+  // NTP is the base; ForeUp's Date header corrects it only when its causal
+  // interval proves ForeUp's clock (which gates the drop) is elsewhere.
+  log('…', 'Clock sync (NTP + ForeUp Date-header bound)');
+  const sync = await syncClock();
+  CLOCK_OFFSET_MS = sync.clock.offsetMs;
+  anchorClock();
+  logClockSync(sync);
+  tev('clock_sync', clockTelemetry(sync));
 
   const api = new ForeupClient();
   await api.loadCookiesFrom(context);
@@ -2032,7 +2181,12 @@ async function main() {
   // Verify API works pre-drop (all courses)
   let sheetAlreadyLive = false;
   for (const course of cfg.courses) {
-    const test = await api.pollTimes(date, course).catch(() => null);
+    const probe = await api.pollTimesDetailed(date, course, 3000).catch(() => null);
+    if (!probe || probe.kind === 'rejected' || probe.kind === 'blocked') {
+      log('✗', `API detector unhealthy for ${course.name}: times API answered ${probe ? `${probe.kind} (HTTP ${probe.status})` : 'nothing (network error)'} — the drop detector would be BLIND. Fix login/cookies before 7pm.`);
+      tev('detector_unhealthy', { course: course.key, kind: probe?.kind ?? 'error', status: probe?.status ?? 0 });
+    }
+    const test = probe?.kind === 'times' ? probe.times : null;
     if (test) {
       sheetAlreadyLive = true;
       saveSheetSnapshot(course, date, test, 'preflight-live'); // free spec-template material for future runs
@@ -2050,11 +2204,12 @@ async function main() {
       const preferred = cfg.courses[0];
       const ranked = preferred ? scouted.get(preferred.key) : undefined;
       if (preferred && ranked?.length) {
-        log('✓', `DRY RUN SPEC ${preferred.name}: ${ranked.map((c, i) => `${fmtTime(c.t.time)}@T+${SPEC_OFFSETS_MS[i]}ms`).join(', ')}`);
+        log('✓', `DRY RUN SPEC ${preferred.name}: ${fmtTime(ranked[0].t.time)} @T+${specPlanMs.join('/')}ms (backups re-aim it only while still blind)`);
       } else if (preferred) {
         log('⚠', `DRY RUN SPEC: no safe predicted ${preferred.name} slot; detect path only`);
       }
     }
+    if (CAPTURE_DROP) await captureDropSheets(api, date, sheetAlreadyLive);
     log('🏁', 'DRY RUN done.');
     tev('outcome', { result: 'dry_run_ok' }); saveTelemetry();
     await cleanup();
@@ -2082,6 +2237,7 @@ async function main() {
       const ranked = preferred ? scouted.get(preferred.key) : undefined;
       if (preferred && ranked?.length) {
         specCands.set(preferred.key, ranked);
+        specPlanned = new Map(specCands);
         log('✓', `SPEC priority: blind-fire ${preferred.name}; other courses remain detect-path fallbacks`);
       } else if (preferred && scouted.size) {
         log('⚠', `SPEC: no safe predicted ${preferred.name} slot — not blind-firing a fallback course`);
@@ -2093,12 +2249,21 @@ async function main() {
   // No waiting if the target date's sheet is already live (re-runs, tests).
   const releaseAt = sevenPmEpoch(now());
   const scheduledDrop = !sheetAlreadyLive && releaseAt > now();
-  const wait = releaseAt - now() - cfg.preDropMs;
+  const wait = releaseAt - now() - preDropMs;
   if (wait > 0 && scheduledDrop) {
-    log('⏳', `${Math.floor(wait / 60000)}m ${Math.ceil((wait % 60000) / 1000)}s until T-${cfg.preDropMs}ms`);
+    log('⏳', `${Math.floor(wait / 60000)}m ${Math.ceil((wait % 60000) / 1000)}s until T-${preDropMs}ms`);
     let browserWarmed = false;
+    let poolWarmed = false;
     let resynced = false;
-    while (releaseAt - now() > cfg.preDropMs) {
+    while (releaseAt - now() > preDropMs) {
+      const jumpMs = wallMinusMonoMs();
+      if (jumpMs > 2_000) {
+        // Monotonic time paused (machine slept): the wall clock is authoritative.
+        log('⚠', `Wall clock is ${Math.round(jumpMs)}ms ahead of monotonic time (sleep/wake?) — re-anchoring`);
+        tev('clock_discontinuity', { jumpMs: Math.round(jumpMs) });
+        anchorClock();
+        resynced = false; // re-measure if still inside the T-30..T-10 window
+      }
       const r = releaseAt - now();
       // T-30s: re-sync the server clock. It was measured minutes ago at arm
       // time; a late, close-to-drop reading corrects any drift so the poll
@@ -2107,12 +2272,19 @@ async function main() {
       // startup inside ten seconds keeps the already-trusted initial clock.
       if (r <= 30_000 && r > 10_000 && !resynced) {
         resynced = true;
-        const [s, n] = await Promise.all([foreupServerOffset().catch(() => null), ntpOffset().catch(() => null)]);
-        const fresh = trustedClockOffset(s, n);
-        if (fresh.source !== 'local' && Math.abs(fresh.offsetMs - CLOCK_OFFSET_MS) >= 20) {
-          log('✓', `Clock re-sync near T-30s: ${CLOCK_OFFSET_MS}ms → ${fresh.offsetMs}ms (${fresh.source}; drift ${fresh.offsetMs - CLOCK_OFFSET_MS}ms)`);
-          tev('clock_resync', { fromMs: CLOCK_OFFSET_MS, toMs: fresh.offsetMs, source: fresh.source, foreupMs: s, ntpMs: n, deltaMs: fresh.deltaMs });
-          CLOCK_OFFSET_MS = fresh.offsetMs;
+        // Bounded twice: the probe has its own 6s budget, and this wait loop
+        // regains control no later than T-9s whatever the network does.
+        const fresh = await settleWithin<ClockSync | null>(syncClock(6000, CLOCK_OFFSET_MS).catch(() => null), Math.max(0, r - 9_000), null);
+        if (!fresh || fresh.clock.source === 'local') {
+          log('⚠', 'Clock re-sync near T-30s gave no usable reading — keeping the arm-time offset');
+          tev('clock_resync', { timedOut: !fresh, keptMs: CLOCK_OFFSET_MS });
+          anchorClock(); // same offset, but only the last ≤30s now ride on the undisciplined monotonic clock
+        } else {
+          const driftMs = fresh.clock.offsetMs - CLOCK_OFFSET_MS;
+          if (Math.abs(driftMs) >= 2) logClockSync(fresh, `Clock re-sync near T-30s (drift ${driftMs}ms)`);
+          tev('clock_resync', { fromMs: CLOCK_OFFSET_MS, ...clockTelemetry(fresh) });
+          CLOCK_OFFSET_MS = fresh.clock.offsetMs;
+          anchorClock();
         }
       }
       // T-3.5s: re-warm each page's connection pool so the hold POST doesn't
@@ -2123,9 +2295,18 @@ async function main() {
           p.evaluate(`fetch('/robots.txt', { cache: 'no-store' }).catch(() => {})`).catch(() => {});
         }
       }
+      // T-1.5s: open one warm keep-alive socket per first-wave poll lane
+      // (undici closes idle sockets after ~4s; the last Node request was the
+      // T-30 re-sync), so the drop polls skip DNS+TCP+TLS entirely.
+      if (r <= 1500 && !poolWarmed) {
+        poolWarmed = true;
+        const sockets = poolWarmSockets(cfg.pollConcurrency, cfg.courses.length);
+        const startedAt = now();
+        api.warmPool(sockets).then((ok) => tev('pool_warm', { sockets, ok, atMs: startedAt - releaseAt, ms: now() - startedAt })).catch(() => {});
+      }
       if (r > 5000) await sleep(1000);
-      else if (r > 500) await sleep(50);
-      else await sleep(5); // tight loop in final 500ms
+      else if (r > 1600) await sleep(50);
+      else await sleep(Math.max(1, Math.min(5, r - preDropMs))); // tight loop near poll start
     }
   }
 
@@ -2151,9 +2332,14 @@ async function main() {
   // On a live sheet (tests, re-runs) spec runs ALONE with a single immediate
   // shot — that is the $0 blind-fire mechanism test; mixing it with the
   // detect walk would double-hold.
-  const specTest = SPEC && sheetAlreadyLive && specCands.size > 0;
-  const specP = specCands.size ? specStrike(pages, specCands, date, t0, specTest ? [0] : SPEC_OFFSETS_MS) : null;
-  if (specP) log('🚀', `SPEC: blind-firing without waiting for detection (${specTest ? 'live-sheet test, single shot' : `T+${SPEC_OFFSETS_MS.join('/')}ms`})`);
+  const specMode = specRunMode({ spec: SPEC, sheetAlreadyLive, specCount: specCands.size, zeroDollarMode: ABORT_BEFORE_BOOK || TEST_PAYMENT });
+  if (SPEC && specCands.size && specMode === 'off') {
+    log('⚠', 'SPEC skipped: the target sheet is already live — racing its real times (detect walk + vulture) instead of one blind shot');
+    tev('spec_skipped', { reason: 'sheet_already_live_money_run' });
+  }
+  const specTest = specMode === 'live_sheet_test';
+  const specP = specMode !== 'off' ? specStrike(pages, specCands, date, t0, specTest ? [0] : specOffsets) : null;
+  if (specP) log('🚀', `SPEC: blind-firing without waiting for detection (${specTest ? 'live-sheet test, single shot' : `T+${specOffsets.join('/')}ms`})`);
 
   let outcome: HoldRunResult = { result: 'exhausted' };
   if (specTest) {
@@ -2175,8 +2361,9 @@ async function main() {
     }
     if (times) {
       log('⚡', `${course.name}: ${times.length} times — ${now() - t0}ms after drop`);
+      if (!detectedSheets.has(course.key)) detectedSheets.set(course.key, new Set(times.map((t) => t.time)));
       tev('detected', { course: course.key, count: times.length });
-      setImmediate(() => saveSheetSnapshot(course, date, times!, 'drop-first-hit', now() - t0));
+      setImmediate(() => { saveSheetSnapshot(course, date, times!, 'drop-first-hit', now() - t0); reportSpecAccuracy(course, times!); });
       const cands = rankCandidates(times, course);
       if (cands.length && !cands[0].inWindow) log('⚠', `Window empty — falling back to ${fmtTime(cands[0].t.time)}`);
       if (!cands.length && times.length) log('✗', `No bookable slots. First few: ${times.slice(0, 5).map((t) => t.time.split(' ')[1]).join(', ')}`);
@@ -2258,14 +2445,28 @@ function banner(line1: string, line2: string, line3: string) {
   console.log('  ╚═════════════════════════════════════════════════╝\n');
 }
 
-main().catch(async (e) => {
-  console.error(`\n  ✗ ${e.stack ?? e.message ?? e}\n`);
-  tev('outcome', { result: 'crash', error: String(e?.message ?? e) });
-  if (activeHoldPages.size) {
-    log('⚠', `Crash cleanup: releasing ${activeHoldPages.size} known pending hold${activeHoldPages.size === 1 ? '' : 's'}`);
-    await Promise.allSettled([...activeHoldPages].map((page) => closeModal(page)));
+// One guarded exit for every fault — including socket errors thrown from
+// callbacks and unawaited rejections, which main().catch never sees.
+async function crashExit(e: unknown): Promise<void> {
+  if (crashing) return;
+  crashing = true;
+  const err = e as Error;
+  console.error(`\n  ✗ ${err?.stack ?? err?.message ?? String(e)}\n`);
+  tev('outcome', { result: 'crash', error: String(err?.message ?? e), paymentSubmitted });
+  if (paymentSubmitted) {
+    log('⚠', 'Crash AFTER PROCESS TRANSACTION — not releasing anything; verify the confirmation email');
+  } else {
+    const releasable = [...activeHoldPages].filter((p) => !handedOffPages.has(p));
+    if (releasable.length) {
+      log('⚠', `Crash cleanup: releasing ${releasable.length} known pending hold${releasable.length === 1 ? '' : 's'}`);
+      await settleWithin(Promise.allSettled(releasable.map((page) => closeModal(page))), 8000, []);
+    }
+    if (handedOffPages.size) log('⚠', 'Crash cleanup: NOT releasing the hold handed to you — finish or close it in the browser');
   }
   saveTelemetry();
   sound('error');
   process.exit(1);
-});
+}
+process.on('uncaughtException', (e) => { void crashExit(e); });
+process.on('unhandledRejection', (e) => { void crashExit(e); });
+main().catch(crashExit);

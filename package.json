@@ -1,7 +1,7 @@
 {
   "name": "bethpage-sniper",
   "version": "1.0.0",
-  "description": "Bethpage tee time sniper \u2014 fast booking at the 7PM drop",
+  "description": "Bethpage tee time sniper — fast booking at the 7PM drop",
   "scripts": {
     "turbo": "tsx src/turbo.ts",
     "turbo:dry": "tsx src/turbo.ts --dry-run",
@@ -13,9 +13,10 @@
     "test-email": "tsx src/test-email.ts",
     "test": "tsx src/tests.ts",
     "typecheck": "tsc --noEmit",
-    "setup": "npx playwright install chromium && echo '\u2713 Browser installed'",
+    "setup": "npx playwright install chromium && echo '✓ Browser installed'",
     "ui": "tsx src/ui-server.ts",
-    "capture": "tsx scripts/capture-run.ts"
+    "capture": "tsx scripts/capture-run.ts",
+    "capture-drop": "tsx src/turbo.ts --dry-run --capture-drop"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

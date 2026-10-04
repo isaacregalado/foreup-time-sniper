@@ -475,3 +475,62 @@ approval.
 
 Start by reading memory + turbo.ts, confirm the current state back to me, then
 give me a short plan before changing code.
+
+## 2026-10-03: SPEED + ACCURACY PASS (local; not yet deployed or live-verified)
+
+Four-lens audit (clock/timing, hot path, SPEC prediction, correctness) → changes
+below. `npm test` 330/330, `tsc --noEmit` clean, dashboard JS parses. No
+request was sent to ForeUp while making these changes.
+
+**Speed / timing**
+- Polling is release-relative (`pollPhase`): one sentinel lane from T-1000,
+  dense 6-lane window T-350..T+400, then 50ms gaps. Re-based July telemetry put
+  the flip anywhere from ~T-180 to ~T+20, so T-200 could start too late.
+- Node keep-alive pool re-warmed at T-1.5s (undici drops idle sockets after
+  ~4s; the drop wave was paying fresh TCP+TLS).
+- SPEC wakes early on detection and yields to the informed detect walk once the
+  sheet is seen; backup shots re-aim the top slot only while still blind.
+- Clock: NTP (min-delay of 5) is the base; ForeUp's Date header gives a causal
+  interval (Marzullo) and only moves the offset when it excludes NTP. The probe
+  is hard-bounded (≤6s, ≤12 req, backoff) — the old one could loop forever and
+  block the T-30 re-sync past T=0. now() runs on the monotonic clock after
+  each sync. SPEC offsets self-calibrate from release-relative poll telemetry
+  (`sentMs`) once ≥2 drops exist; SPEC_FIRE_MS overrides.
+- Drop detector timeout 1.5s → 3s (a stalled populated response is kept).
+
+**SPEC accuracy** (`src/spec-template.ts`)
+- Morning fees only come from a PROVEN full-rate row ('morning' ≤ noon, or a
+  'step' where the same sheet later drops to twilight). The old "≤4pm" rule
+  would have put twilight fees on morning slots in the fall.
+- Weekend Red has never had a full-rate capture, so SPEC stays OFF for Sunday
+  Red (with a clear reason) until one exists. Get one with a read-only
+  capture on a non-race night: `npm run capture-drop -- --course red,green`
+  started 18:50–18:59 on a Saturday.
+- Deploy scripts now merge logs/sheets both ways (box ↔ Mac).
+- Every drop diffs the armed prediction against the real first sheet
+  (`spec_payload_check`). SPEC_HOLIDAYS=MM-DD-YYYY,... opts holidays into
+  weekend fees.
+
+**Correctness / safety**
+- IMAP 'error' listener (a socket reset used to crash the run); bounded,
+  self-reconnecting checkout baseline.
+- Code email has no course name: if Red+Green held the same time, the loser's
+  code could be entered. Checkout now excludes a rejected code and tries the
+  next matching one (≤3).
+- `paymentSubmitted` set before PROCESS TRANSACTION; crash cleanup never
+  releases after it. Checkout throws → FINISH BY HAND, not a crash.
+- A money run on an already-live sheet no longer fires one blind SPEC shot and
+  quits — it races the real times + vulture.
+- Vulture per-slot backoff 20→160s, race-lost slots start backed off, 60s pause
+  on "Invalid request" (soft rate limit).
+- isVisible({timeout}) is ignored by Playwright 1.58 → waitFor (money gate #2
+  no longer releases a won hold on a slow modal paint).
+- TZ pinned to America/New_York in-process; DATE CHECK warns when --date is not
+  tonight's drop date. Dashboard: untouched date picker sends no --date (turbo
+  computes D+7 at run time), arms always pass --race, degraded systems checks
+  say DEGRADED.
+
+**Before trusting a live run:** one `--dry-run --spec` systems check from the
+box after syncing (watch the clock line + detector check), then the usual
+bounded `$0 --no-book` rehearsal. Mac .env currently has VULTURE_POLL_SEC=60 /
+VULTURE_MIN=720 / COURSE=red — the AWS sync copies those to the box.

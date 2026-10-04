@@ -135,6 +135,16 @@ rsync -az -e "ssh ${SSH_OPTS[*]}" \
   ~/bethpage-sniper/tsconfig.json ~/bethpage-sniper/.env ~/bethpage-sniper/auth \
   "ubuntu@$PUBIP:~/bethpage-sniper/"
 
+# SPEC's sheet library is what lets the box predict a morning hold: the Mac's
+# scouts carry fee proofs, the box's drop runs capture real morning sheets.
+# Snapshot names are unique + immutable, so a no-overwrite merge both ways is
+# conflict-free. (Public tee-sheet rows only — no card or credentials.)
+echo "→ Merging the SPEC sheet library both ways"
+vm 'mkdir -p ~/bethpage-sniper/logs/sheets'
+mkdir -p ~/bethpage-sniper/logs/sheets
+rsync -az --ignore-existing -e "ssh ${SSH_OPTS[*]}" ~/bethpage-sniper/logs/sheets/ "ubuntu@$PUBIP:~/bethpage-sniper/logs/sheets/"
+rsync -az --ignore-existing -e "ssh ${SSH_OPTS[*]}" "ubuntu@$PUBIP:~/bethpage-sniper/logs/sheets/" ~/bethpage-sniper/logs/sheets/
+
 echo "→ npm ci + Playwright Chromium"
 vm 'set -e
 cd ~/bethpage-sniper

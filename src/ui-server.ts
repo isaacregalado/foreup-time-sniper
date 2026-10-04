@@ -159,7 +159,7 @@ function clearSchedule() {
   schedule = null; scheduleTimer = null;
   updateCaffeinate();
 }
-const publicSchedule = () => schedule ? { mode: schedule.mode, at: new Date(schedule.at).toISOString(), courses: schedule.courses, target: schedule.target, players: schedule.players ?? null, spec: schedule.spec ?? false } : null;
+const publicSchedule = () => schedule ? { mode: schedule.mode, at: new Date(schedule.at).toISOString(), courses: schedule.courses, target: schedule.target, players: schedule.players ?? null, date: schedule.date ?? null, spec: schedule.spec ?? false } : null;
 
 // Log-line → phase + plain English. First match wins; order matters.
 const PHASE_MAP: Array<{ re: RegExp; phase: Phase; text: (m: RegExpMatchArray) => string }> = [
@@ -167,6 +167,7 @@ const PHASE_MAP: Array<{ re: RegExp; phase: Phase; text: (m: RegExpMatchArray) =
   { re: /Logging in/,                 phase: 'bootstrap', text: () => 'Logging into your ForeUp account…' },
   { re: /Logged in/,                  phase: 'bootstrap', text: () => 'Logged in. Syncing clock and email…' },
   { re: /preflight: flow markers MISSING/, phase: 'failed', text: () => 'ForeUp changed their booking flow — re-map before trusting a real run.' },
+  { re: /API detector unhealthy/, phase: 'bootstrap', text: () => 'Tee-sheet detector is NOT working (login/WAF) — fix before 7pm or the drop will be missed.' },
   { re: /preflight: their JS updated/, phase: 'bootstrap', text: () => 'ForeUp updated their code, but the mapped flow still matches.' },
   { re: /ForeUp preflight: v/, phase: 'bootstrap', text: () => 'ForeUp’s code still matches the mapped flow.' },
   { re: /IMAP ready|skipping IMAP/,   phase: 'ready',     text: () => 'All systems ready. Checking the tee sheet…' },
@@ -243,7 +244,7 @@ function emitVerdict() {
     state.verdict = { kind: 'manual', title: 'FINISH BY HAND', detail: 'The slot is held for ~5 minutes. Switch to the open Chrome window and continue where it stopped: code → Book Time → Pay at Facility → card details → PROCESS TRANSACTION (the only charging click).' };
   } else if (state.phase === 'test_passed') {
     state.verdict = state.mode === 'dry'
-      ? { kind: 'test_passed', title: 'SYSTEMS CHECK PASSED', detail: 'Login, clock sync, email and tee-sheet access all work. Nothing was held or charged.' }
+      ? { kind: 'test_passed', title: 'SYSTEMS CHECK PASSED', detail: dryDetail() }
       : { kind: 'test_passed', title: 'TEST PASSED', detail: `Held ${heldWhat || 'a real slot'} then released it on purpose. $0 charged. The real run will work the same way.` };
   } else {
     const lastErr = [...state.lines].reverse().find((l) => l.includes('✗')) ?? state.lines[state.lines.length - 1] ?? '';
@@ -251,6 +252,17 @@ function emitVerdict() {
   }
   broadcast('verdict', { verdict: state.verdict, phase: state.phase });
   if (['booked', 'ready_click', 'manual'].includes(state.verdict?.kind ?? '')) startProofWatch();
+}
+
+/** A systems check can pass while running degraded (SPEC off, no ForeUp clock
+ *  bound, blind detector, wrong date). Surface that in the verdict itself. */
+function dryDetail(): string {
+  const base = 'Login, clock sync, email and tee-sheet access all work. Nothing was held or charged.';
+  const degraded = state.lines
+    .filter((l) => /spec disabled|no safe predicted|ForeUp probe|API detector unhealthy|DATE CHECK|detector poll/.test(l))
+    .slice(0, 3)
+    .map((l) => l.replace(/^\s*[✗⚠✓ℹ…]\s*(\[[^\]]*\]\s*)?/, '').slice(0, 140));
+  return degraded.length ? `${base} DEGRADED: ${degraded.join(' · ')}` : base;
 }
 
 function finalizeRun(code: number | null) {
@@ -269,7 +281,7 @@ function finalizeRun(code: number | null) {
     state.verdict = { kind: 'ready_click', title: 'ONE CLICK LEFT', detail: `${heldWhat || 'Your slot'} is held with the code entered and the card filled in. Switch to the Chrome window and click “PROCESS TRANSACTION” to finish — that click is the only thing that charges the $5/player fee. The hold lasts ~5 minutes.` };
   } else if (state.phase === 'test_passed') {
     state.verdict = state.mode === 'dry'
-      ? { kind: 'test_passed', title: 'SYSTEMS CHECK PASSED', detail: 'Login, clock sync, email and tee-sheet access all work. Nothing was held or charged.' }
+      ? { kind: 'test_passed', title: 'SYSTEMS CHECK PASSED', detail: dryDetail() }
       : { kind: 'test_passed', title: 'TEST PASSED', detail: `Held ${heldWhat || 'a real slot'} then released it on purpose. $0 charged. The real run will work the same way.` };
   } else if (state.phase === 'manual') {
     state.verdict = { kind: 'manual', title: 'FINISH BY HAND', detail: 'The slot is held for ~5 minutes. Switch to the open Chrome window and continue where it stopped: code → Book Time → Pay at Facility → card details → PROCESS TRANSACTION (the only charging click).' };
@@ -301,6 +313,7 @@ async function arm(mode: Mode, date?: string, courses?: string[], target: Target
     if (!cs.valid) return { ok: false, error: `Card looks wrong: ${cs.issues.join('; ')}. Fix FEE_CARD_* in .env before an auto-book run.` };
   }
   const turboFlags: string[] = [];
+  turboFlags.push('--race'); // the only supported drop mode — never depend on .env RACE=1
   if (mode === 'test') turboFlags.push('--no-book');
   if (mode === 'dry') turboFlags.push('--dry-run');
   if (date) turboFlags.push('--date', date);
