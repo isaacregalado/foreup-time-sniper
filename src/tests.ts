@@ -1359,8 +1359,10 @@ section('Turbo race-policy wiring contract');
   assert(!/holdViaBridge|specStrike|holdPhase|browserBook/.test(capture), 'capture-drop: read-only, never holds');
   const pay = turbo.slice(turbo.indexOf('// 12. The charge.'), turbo.indexOf('if (AUTO_BOOK && !filled)'));
   assert(pay.indexOf('paymentSubmitted = true') >= 0 && pay.indexOf('paymentSubmitted = true') < pay.indexOf("locator('a#submit').click()"), 'payment safety: flag set before the charging click');
-  const aws = fs.readFileSync('deploy/aws-setup.sh', 'utf8');
-  assert(aws.includes('rsync -az --ignore-existing') && aws.includes('logs/sheets/'), 'deploy: SPEC sheet library merged both ways without overwrite');
+  if (fs.existsSync('deploy/aws-setup.sh')) { // deploy/ lives on the Mac only, not on the race boxes
+    const aws = fs.readFileSync('deploy/aws-setup.sh', 'utf8');
+    assert(aws.includes('rsync -az --ignore-existing') && aws.includes('logs/sheets/'), 'deploy: SPEC sheet library merged both ways without overwrite');
+  }
   const uiSrc = fs.readFileSync('src/ui-server.ts', 'utf8');
   const uiHtml = fs.readFileSync('static/turbo-ui.html', 'utf8');
   assert(uiSrc.includes("turboFlags.push('--race');"), 'dashboard: race mode is explicit');

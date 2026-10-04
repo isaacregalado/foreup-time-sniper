@@ -467,7 +467,7 @@ let CLOCK_OFFSET_MS = 0;
 // (sleep/wake, where monotonic time paused) re-anchors to the wall clock.
 let clockAnchor: { wallMs: number; monoMs: number } | null = null;
 const now = () => (clockAnchor
-  ? clockAnchor.wallMs + (performance.now() - clockAnchor.monoMs) + CLOCK_OFFSET_MS
+  ? Math.round(clockAnchor.wallMs + (performance.now() - clockAnchor.monoMs) + CLOCK_OFFSET_MS) // whole ms: logs/telemetry stay integers
   : Date.now() + CLOCK_OFFSET_MS);
 function anchorClock(): void { clockAnchor = { wallMs: Date.now(), monoMs: performance.now() }; }
 /** Wall-clock movement relative to monotonic time since the last anchor. */

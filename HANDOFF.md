@@ -547,3 +547,19 @@ VULTURE_MIN=720 / COURSE=red — the AWS sync copies those to the box.
   run graded PASS/FAIL per course (login, staging, bridge, detector, ForeUp
   flow, clock, IMAP, date). Offline grader check: VERIFY_REPLAY=<run log>.
 - SPEC is off for Black until Black fee proofs exist (detect path races it).
+
+### 2026-10-03 ~21:15 ET: VERIFIED LIVE (read-only + $0)
+- Mac had NO Playwright browsers for the installed playwright 1.58.2 (every
+  Mac run would have crashed at launch) — installed chromium-1208 + headless
+  shell.
+- `npm run verify -- --course black,red`: READY on the Mac and on the AWS box
+  (login, Black+Red staged, bridge ready on both, detector healthy, 18/18 flow
+  markers, IMAP). Clock: Mac 0ms ±5 (ForeUp interval contains NTP), box −1ms ±3.
+- $0 rehearsals on the new code (one hold each, released by exact DELETE 200):
+  Red 10-05 5:00pm — detect T+394 → HELD T+1231 → modal verified → released.
+  Black 10-05 3:40pm — detect T+288 → HELD T+942 → modal "Bethpage Black
+  Course" verified → released.
+- Black facts: 10-minute grid (15:10, 15:40), booking fee $5/person (same as
+  Red), side 1014, weekday green fee $44.
+- Claude Code permission rules added (user settings) for verify, dry-run,
+  --race --no-book, aws-setup.sh and box verify/dry-run only; AUTO_BOOK denied.

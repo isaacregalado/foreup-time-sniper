@@ -39,7 +39,8 @@ console.log(`\n  ⛳ Verify drop readiness — ${courses.join(' + ')} · ${date}
 
 for (const [name, cmd] of (process.env.VERIFY_REPLAY ? [] : [['unit tests', ['run', 'test']], ['typecheck', ['run', 'typecheck']]] as const)) {
   const r = spawnSync('npm', [...cmd], { cwd: root, encoding: 'utf8' });
-  const tail = (r.stdout + r.stderr).trim().split('\n').filter((l) => /passed|failed|error/i.test(l)).slice(-1)[0] ?? '';
+  const out = (r.stdout + r.stderr).trim().split('\n');
+  const tail = out.filter((l) => /\d+ passed, \d+ failed/.test(l)).slice(-1)[0] ?? out.filter((l) => /error TS/.test(l)).slice(-1)[0] ?? '';
   add(name, r.status === 0, tail.trim());
 }
 
