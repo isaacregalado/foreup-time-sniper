@@ -117,3 +117,17 @@ export function pollPhase(tRelMs: number, concurrency: number, staggerMs: number
 export function poolWarmSockets(concurrency: number, courses: number, cap = 12): number {
   return Math.max(1, Math.min(cap, Math.floor(concurrency) * Math.max(1, Math.floor(courses))));
 }
+
+/** The online booking fee ForeUp lists on the slot itself (every Bethpage
+ * row carries booking_fee_price / booking_fee_per_person; Red is $5/person).
+ * Money gate #5 compares the card window against THIS, so a course whose
+ * fee differs is verified instead of aborted. Implausible or missing values
+ * fall back to the mapped $5/person. */
+export function bookingFeeTotal(
+  slot: Record<string, unknown>,
+  players: number, fallbackPerPlayer = 5, maxPerPlayer = 25,
+): number {
+  const price = Number(slot.booking_fee_price);
+  if (!Number.isFinite(price) || price <= 0 || price > maxPerPlayer) return fallbackPerPlayer * players;
+  return slot.booking_fee_per_person === false ? price : price * players;
+}

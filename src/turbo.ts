@@ -47,6 +47,7 @@ import {
   firstModalIdentityMismatch,
   missingSpecTemplateFields,
   settleWithin,
+  bookingFeeTotal,
   classifyTimesResponse,
   etDropTargetDate,
   isSoftLimitRejection,
@@ -74,6 +75,7 @@ import {
   dayClassOf,
   isoDate,
   latticePhase,
+  latticeStep,
   mdYDayNum,
   mergeSpecTemplate,
   pickFullRateAnchor,
@@ -923,15 +925,34 @@ async function bootstrap(date: string): Promise<{ context: BrowserContext; pages
   // Pre-stage a page per course: right teesheet, target date, players filter.
   // SPEC and detected Red holds share Red's one actor/page; Green has its own
   // localStorage so a simultaneous callback cannot remove Red's pending ID.
+  // One course failing to stage (e.g. Black's page misbehaving) must never
+  // cancel the others: retry once in a fresh context, then race without it.
   const pages = new Map<string, Page>();
-  await stagePage(page, cfg.courses[0], date);
-  pages.set(cfg.courses[0].key, page);
-  for (const course of cfg.courses.slice(1)) {
-    const isolated = await browser.newContext({ storageState: authenticatedState, userAgent: CHROME_UA });
-    const p = await isolated.newPage();
-    await stagePage(p, course, date);
-    pages.set(course.key, p);
+  const stageWithRetry = async (course: CourseCfg, first: Page | null): Promise<Page | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const p = attempt === 0 && first
+          ? first
+          : await (await browser.newContext({ storageState: authenticatedState, userAgent: CHROME_UA })).newPage();
+        await stagePage(p, course, date);
+        return p;
+      } catch (e) {
+        log('⚠', `Staging ${course.name} failed (attempt ${attempt + 1}/2): ${(e as Error).message}`);
+      }
+    }
+    return null;
+  };
+  for (const [i, course] of cfg.courses.entries()) {
+    const p = await stageWithRetry(course, i === 0 ? page : null);
+    if (p) pages.set(course.key, p);
+    else {
+      log('✗', `${course.name} could not be staged — racing WITHOUT it`);
+      tev('stage_failed', { course: course.key });
+    }
   }
+  if (!pages.size) throw new Error('No course could be staged — nothing to race');
+  // Priority, SPEC and the course actors only ever see staged pages.
+  for (let i = cfg.courses.length - 1; i >= 0; i--) if (!pages.has(cfg.courses[i].key)) cfg.courses.splice(i, 1);
   return { context, pages, userId };
 }
 
@@ -1392,13 +1413,14 @@ async function completeBooking(
 
   // 10. Money gate #5 — the amount must be exactly $5 × players.
   const amount = ((await frame.locator('#lblTotalValue').innerText().catch(() => '')) || '').trim();
-  const expected = `$${(FEE_PER_PLAYER * cand.players).toFixed(2)}`;
+  const feeTotal = bookingFeeTotal(cand.t, cand.players, FEE_PER_PLAYER);
+  const expected = `$${feeTotal.toFixed(2)}`;
   if (amount !== expected) {
     log('✗', `MISMATCH: card window shows ${amount || '(unreadable)'}, expected ${expected}. NOT touching the card form — inspect the browser before doing anything.`);
     tev('abort', { gate: 'amount', amount, expected });
     return 'manual_needed';
   }
-  log('✓', `Fee verified: ${amount} (${cand.players} × $${FEE_PER_PLAYER})`);
+  log('✓', `Fee verified: ${amount} (${cand.players} player${cand.players === 1 ? '' : 's'}, ${cand.course.name} online fee)`);
 
   // 11. Pre-fill the card (no saved-card option exists in this window).
   const card = cfg.feeCard;
@@ -1568,8 +1590,9 @@ async function buildSpecCandidates(api: ForeupClient, date: string): Promise<Map
     }
     const library = loadSheetRecords(course.key);
     const { anchor, reason } = pickFullRateAnchor(library, course.key, date, SPEC_HOLIDAYS);
-    const phase = latticePhase(library, course.key);
-    const inferred = anchor ? predictWindowFromAnchor(anchor, phase, cfg.windowStart, cfg.windowEnd) : [];
+    const step = latticeStep(library, course.key); // 9 for Red; learned per course (Black may differ)
+    const phase = latticePhase(library, course.key, step);
+    const inferred = anchor ? predictWindowFromAnchor(anchor, phase, cfg.windowStart, cfg.windowEnd, step) : [];
     // Observed rows (exact-weekday drop captures first) beat inferred rows on collisions.
     const scouts = [...loadSheetSnapshots(course, date, library), ...liveScouts, inferred];
     const tpl = mergeSpecTemplate(scouts);
@@ -1583,7 +1606,7 @@ async function buildSpecCandidates(api: ForeupClient, date: string): Promise<Map
     tev('spec_anchor', {
       course: course.key, evidence: anchor?.evidence ?? null,
       source: anchor ? `${anchor.date} ${anchor.t.time.split(' ')[1]}` : null,
-      greenFee: anchor?.t.green_fee ?? null, phase, reason: reason || null,
+      greenFee: anchor?.t.green_fee ?? null, step, phase, reason: reason || null,
     });
     const cands = rankCandidates(specPredictTimes(tpl, date, cfg.players, cfg.holes), course).filter((c) => c.inWindow);
     const invalid = cands.map((cand) => ({ cand, missing: missingSpecTemplateFields(cand.t) }))
@@ -2390,13 +2413,13 @@ async function main() {
     case 'booked':
       tev('outcome', { result: 'booked', totalMs: now() - t0, auto: true }); saveTelemetry();
       sound('success');
-      banner(`BOOKED ${label}`, `${date} · ${cand?.players ?? cfg.players} players · $${FEE_PER_PLAYER * (cand?.players ?? cfg.players)} charged`, 'Proof: confirmation email + card charge');
+      banner(`BOOKED ${label}`, `${date} · ${cand?.players ?? cfg.players} players · $${cand ? bookingFeeTotal(cand.t, cand.players, FEE_PER_PLAYER) : FEE_PER_PLAYER * cfg.players} charged`, 'Proof: confirmation email + card charge');
       await keepAliveForManual(context);
       break;
     case 'ready':
       tev('outcome', { result: 'ready_for_click', totalMs: now() - t0 }); saveTelemetry();
       sound('success'); sound('alert');
-      banner('READY — ONE CLICK LEFT', label, `${date} · ${cand?.players ?? cfg.players} players · $${FEE_PER_PLAYER * (cand?.players ?? cfg.players)} on your click`);
+      banner('READY — ONE CLICK LEFT', label, `${date} · ${cand?.players ?? cfg.players} players · $${cand ? bookingFeeTotal(cand.t, cand.players, FEE_PER_PLAYER) : FEE_PER_PLAYER * cfg.players} on your click`);
       await keepAliveForManual(context);
       break;
     case 'manual_needed':

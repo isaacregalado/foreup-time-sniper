@@ -147,7 +147,21 @@ export function pickFullRateAnchor(
   };
 }
 
-/** Lattice phase (minute mod 9) from EVERY sheet of the course — slot times
+/** Tee interval for a course: gcd of every gap between consecutive slots in
+ *  its saved sheets (Red: 9). Courses are not assumed to share Red's grid; an
+ *  implausible or unknown result falls back to 9, and latticePhase then
+ *  refuses inference unless every saved slot agrees with it. */
+export function latticeStep(recs: SheetRecord[], courseKey: string, fallback = SPEC_LATTICE_MIN): number {
+  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+  let g = 0;
+  for (const r of recs.filter((x) => x.course === courseKey)) {
+    const mins = [...new Set(r.times.map(slotMinOf).filter(Number.isFinite))].sort((a, b) => a - b);
+    for (let i = 1; i < mins.length; i++) g = gcd(g, mins[i] - mins[i - 1]);
+  }
+  return g >= 5 && g <= 15 ? g : fallback;
+}
+
+/** Lattice phase (minute mod step) from EVERY sheet of the course — slot times
  *  are rate-agnostic. null when sheets disagree (the grid changed). */
 export function latticePhase(recs: SheetRecord[], courseKey: string, step = SPEC_LATTICE_MIN): number | null {
   const phases = new Set(recs.filter((r) => r.course === courseKey)

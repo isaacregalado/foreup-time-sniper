@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import { bookingCodeContextMatches, EmailMonitor, pickBookingCode } from './email-monitor';
 import {
-  classifyTimesResponse, etDropTargetDate, firstModalIdentityMismatch, isSoftLimitRejection, missingSpecTemplateFields,
+  bookingFeeTotal, classifyTimesResponse, etDropTargetDate, firstModalIdentityMismatch, isSoftLimitRejection, missingSpecTemplateFields,
   pollPhase, poolWarmSockets, settleWithin, specRunMode, vultureRetryDelayMs,
 } from './turbo-guards';
 import {
@@ -18,7 +18,7 @@ import {
   releaseSendBracket, summarizeReleaseRuns, type DateSample,
 } from './clock-sync';
 import {
-  dayClassOf, fullRateAnchorOf, isoDate, isWeekendDate, latticePhase, mergeSpecTemplate, pickFullRateAnchor,
+  dayClassOf, fullRateAnchorOf, isoDate, isWeekendDate, latticePhase, latticeStep, mergeSpecTemplate, pickFullRateAnchor,
   predictWindowFromAnchor, snapshotFileName, specPayloadDiff, specPredictTimes, specScoutDates, specShotIsLate, specShotTarget,
 } from './spec-template';
 
@@ -1123,6 +1123,25 @@ await (async () => {
 // ════════════════════════════════════════════════════════════
 section('Turbo safety guards — production helpers');
 
+// Any Bethpage course (Black included): fee gate + tee grid come from the course's own data.
+{
+  assertEqual(bookingFeeTotal({ booking_fee_price: 5, booking_fee_per_person: true }, 4), 20, 'fee gate: Red $5/person × 4');
+  assertEqual(bookingFeeTotal({ booking_fee_price: 7, booking_fee_per_person: true }, 3), 21, 'fee gate: a different per-person course fee is verified, not aborted');
+  assertEqual(bookingFeeTotal({ booking_fee_price: 10, booking_fee_per_person: false }, 4), 10, 'fee gate: flat per-booking fee');
+  assertEqual(bookingFeeTotal({}, 2), 10, 'fee gate: missing fee field falls back to $5/person');
+  assertEqual(bookingFeeTotal({ booking_fee_price: 500 }, 2), 10, 'fee gate: implausible fee falls back to $5/person');
+  const rec = (course: string, date: string, hms: string[]) => ({ course, date, savedAt: '', times: hms.map((h) => ({ time: `${isoDate(date)} ${h}`, green_fee: 80 })) });
+  assertEqual(latticeStep([rec('red', '08-03-2026', ['09:48', '14:27', '15:21'])], 'red'), 9, 'lattice step: Red grid is 9 minutes');
+  const black = [rec('black', '10-05-2026', ['07:00', '07:10', '13:40']), rec('black', '10-06-2026', ['15:20', '15:30'])];
+  assertEqual(latticeStep(black, 'black'), 10, 'lattice step: a 10-minute course is learned, not assumed to be Red');
+  assertEqual(latticePhase(black, 'black', 10), 0, 'lattice phase: 10-minute grid on the hour');
+  assertEqual(latticePhase(black, 'black'), null, 'lattice phase: Red step on a 10-minute grid refuses inference');
+  const anchor = { t: { time: '2026-10-05 07:00', green_fee: 80 }, min: 420, date: '10-05-2026', evidence: 'morning' as const };
+  const rows = predictWindowFromAnchor(anchor, 0, 6 * 60, 8 * 60 + 30, 10);
+  assertEqual(rows[rows.length - 1].time, '2026-10-05 08:30', 'lattice: 10-minute course predicts 8:30 as the latest slot');
+  assertEqual(latticeStep([rec('black', '10-05-2026', ['07:00'])], 'black'), 9, 'lattice step: no gaps yet falls back safely');
+}
+
 // Review fixes: clock fusion without NTP, and calibration uses the re-sync offset.
 {
   const iv = { lo: 2422, hi: 2619, votes: 6, used: 6, minRttMs: 90 };
@@ -1330,6 +1349,7 @@ section('Turbo race-policy wiring contract');
   assert(!/isVisible\(\{ timeout/.test(turbo), 'playwright: no ignored isVisible timeouts remain');
   assert(turbo.includes("pBtn.waitFor({ state: 'visible', timeout: 3000 })"), 'money gate #2 waits for the in-modal players chip');
   assert(turbo.includes("const specTest = specMode === 'live_sheet_test';"), 'spec: live-sheet single shot is $0-only');
+  assert(turbo.includes('racing WITHOUT it') && turbo.includes('const stageWithRetry = async'), 'staging: one course failing (e.g. Black) never cancels the others');
   assert(turbo.includes("process.env.TZ = 'America/New_York';"), 'turbo: drop math pinned to ET');
   assert(turbo.includes('DATE CHECK:'), 'turbo: wrong-date arm is loud');
   assert(turbo.includes('for (const k of raceAttempted) tries.set('), 'vulture: race-lost slots start backed off');
@@ -1366,7 +1386,7 @@ section('Turbo race-policy wiring contract');
   const checkout = turbo.slice(turbo.indexOf('async function completeBooking'), turbo.indexOf('// Every detection snapshots'));
   assert(checkout.includes('a:text-is("${cand.players}")'), 'player fallback money gate: modal button uses candidate party size');
   assert(checkout.includes('Number(model.players) !== cand.players'), 'player fallback money gate: ForeUp reservation model uses candidate party size');
-  assert(checkout.includes('FEE_PER_PLAYER * cand.players'), 'player fallback money gate: required fee is exactly $5 times candidate party size');
+  assert(checkout.includes('bookingFeeTotal(cand.t, cand.players, FEE_PER_PLAYER)'), 'player fallback money gate: required fee is the slot fee times candidate party size');
   const finalize = turbo.slice(turbo.indexOf('async function finalizeHeldAttempts'), turbo.indexOf('/**\n * The drop race'));
   const identityGate = finalize.indexOf('await inspectModalIdentity(candidate.page');
   const loserRelease = finalize.indexOf('const loserReleases');

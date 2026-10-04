@@ -534,3 +534,16 @@ request was sent to ForeUp while making these changes.
 box after syncing (watch the clock line + detector check), then the usual
 bounded `$0 --no-book` rehearsal. Mac .env currently has VULTURE_POLL_SEC=60 /
 VULTURE_MIN=720 / COURSE=red — the AWS sync copies those to the box.
+
+### 2026-10-03 (later): Black ≡ Red
+- Black has never run (no logs, no sheets). Code paths are course-generic; two
+  Red-only assumptions removed: money gate #5 now verifies the card amount
+  against the slot's own booking_fee_price/per_person (fallback $5/person),
+  and SPEC learns each course's tee interval (gcd of its sheet gaps) instead
+  of assuming Red's 9 minutes.
+- A course that fails to stage (retried once in a fresh context) is dropped
+  with a loud ✗ and the others still race — Black can no longer take Red down.
+- `npm run verify -- --course black,red` = tests + typecheck + read-only dry
+  run graded PASS/FAIL per course (login, staging, bridge, detector, ForeUp
+  flow, clock, IMAP, date). Offline grader check: VERIFY_REPLAY=<run log>.
+- SPEC is off for Black until Black fee proofs exist (detect path races it).

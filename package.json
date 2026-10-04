@@ -16,7 +16,8 @@
     "setup": "npx playwright install chromium && echo '✓ Browser installed'",
     "ui": "tsx src/ui-server.ts",
     "capture": "tsx scripts/capture-run.ts",
-    "capture-drop": "tsx src/turbo.ts --dry-run --capture-drop"
+    "capture-drop": "tsx src/turbo.ts --dry-run --capture-drop",
+    "verify": "tsx scripts/verify-drop.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
