@@ -103,13 +103,26 @@ export function classifyTimesResponse(status: number, text: string): { kind: Pol
 /** Drop-poll schedule relative to the release epoch. One sentinel lane from
  * T-1000 insures against an early or clock-skewed release (re-based July
  * telemetry put the flip anywhere from ~T-180 to ~T+20); full density only
- * inside [T-350, T+400], then a gentler cadence. null = do not launch yet. */
+ * inside [T-350, T+400], then a gentler cadence. If the sheet is still not
+ * out by T+5s the release is late: drop to a slow tail so the poll budget
+ * covers ~2 more minutes instead of burning out in 30s. null = not yet. */
 export interface PollPhase { maxInFlight: number; minGapMs: number }
 export function pollPhase(tRelMs: number, concurrency: number, staggerMs: number): PollPhase | null {
   if (tRelMs < -1000) return null;
   if (tRelMs < -350) return { maxInFlight: 1, minGapMs: 100 };
   if (tRelMs < 400) return { maxInFlight: Math.max(1, concurrency), minGapMs: Math.max(staggerMs, 15) };
-  return { maxInFlight: Math.max(1, concurrency), minGapMs: 50 };
+  if (tRelMs < 5000) return { maxInFlight: Math.max(1, concurrency), minGapMs: 50 };
+  return { maxInFlight: Math.min(2, Math.max(1, concurrency)), minGapMs: 250 };
+}
+
+/** Vulture cadence. The minutes right after a lost race are the best ones:
+ * unpaid holds expire at exactly +5 min and get re-listed, so poll every
+ * second through that wave whatever the long-monitor cadence is (a 60s
+ * cancellation watch would sleep straight through it). After the fast phase
+ * the configured cadence applies. */
+export const VULTURE_FAST_PHASE_MS = 8 * 60_000;
+export function vulturePollDelayMs(elapsedSinceDropMs: number, configuredMs: number, fastMs = 1000): number {
+  return elapsedSinceDropMs < VULTURE_FAST_PHASE_MS ? Math.min(configuredMs, fastMs) : configuredMs;
 }
 
 /** Keep-alive sockets to open just before the drop: one per first-wave poll

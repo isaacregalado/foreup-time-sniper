@@ -115,6 +115,12 @@ export class EmailMonitor {
     await this.resetBaseline();
   }
 
+  /** True while the IMAP session looks alive (it can still be half-open —
+   * callers bound their waits). */
+  isHealthy(): boolean {
+    return this.connected && !!this.client.usable;
+  }
+
   /** Checkout-path baseline: a bounded NOOP on the existing session; if the
    * socket is dead or half-open, reconnect once (connect() re-baselines).
    * The IMAP session idles through the whole drop, so this must never be

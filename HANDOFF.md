@@ -563,3 +563,59 @@ VULTURE_MIN=720 / COURSE=red — the AWS sync copies those to the box.
   Red), side 1014, weekday green fee $44.
 - Claude Code permission rules added (user settings) for verify, dry-run,
   --race --no-book, aws-setup.sh and box verify/dry-run only; AUTO_BOOK denied.
+
+## 2026-10-04 (early AM): BULLETPROOFING PASS — verified live on Mac + AWS box
+
+**A real checkout bug, found by the first-ever `--test-payment` run and fixed.**
+The post-July "fresh winner code" logic clicked Resend right after the hold.
+ForeUp's modal already sends a code on open (createConfirmation), and Resend
+sends a DIFFERENT one — two codes ~0.5s apart, and "Book Time" refused the one
+entered (its message goes to #booking-error, which the bot never read). The
+code step now: uses the auto-sent code (the flow July's booking proved), reads
+ForeUp's answer after each Book Time click (Payment Method vs #booking-error),
+tries the next matching code only on an explicit refusal, and requests a fresh
+code only if none arrives in 45s / all were refused / IMAP had to reconnect.
+A stall logs "Checkout evidence" (ForeUp's message, captcha state, failed
+requests) and saves logs/debug-checkout-*.png.
+- `--test-payment` now PASSES on the Mac (headed) and on the AWS box
+  (headless): hold → code (7s) → Book Time → model gate → Pay at Facility →
+  Element card window → $5.00 verified → card filled → released (DELETE 200).
+  Only the PROCESS TRANSACTION click itself is untested (it cannot be at $0).
+
+**Auto-arm no longer depends on the Mac** (src/remote-arm.ts, ui-server.ts).
+Setting an auto-arm with a remote target gives the BOX its own timer: a tmux
+session `armtimer` that sleeps until the arm time and renames itself to the
+run session `snipe`. The Mac attaches 4s later and only follows (or replays a
+finished run — its log starts with `# armtimer <epoch>`); it starts the run
+itself only if the box did not AND the arm is <5 min late. A stale arm never
+starts a run. Cancel must be confirmed by the box (ARMTIMER_GONE) or it is
+reported as still armed. The schedule is saved to logs/schedule.json and
+restored after a dashboard restart. Verified on the real box (timer fired at
+the minute, "The box started this run on its own timer", late-attach replay,
+stale → nothing started, confirmed cancel) and by `npm run test:armtimer`
+(21 checks against a real local tmux). tmux gotchas encoded: `-t name` prefix-
+matches (use `"=name"`, always QUOTED — zsh expands a bare `=word`).
+
+**Other hardening**
+- Bootstrap retried up to 3× in a fresh browser; IMAP connect failure at arm
+  time no longer cancels the race; SPEC scout errors can't kill a run.
+- IMAP waits are bounded (a half-open socket could hang past the hold);
+  session refreshed at T-20s; vulture keepalive self-reconnects.
+- Vulture polls every 1s for the first 8 min (the +5-minute expiry wave) even
+  with VULTURE_POLL_SEC=60, then the configured cadence.
+- Poll schedule gets a slow tail after T+5s (600 polls now cover ~2 min of a
+  late release instead of burning out in 30s).
+- `--dry-run --simulate-drop [s]` (and `npm run verify -- --simulate-drop`):
+  read-only rehearsal of the real countdown, T-30 re-sync, warm-ups and
+  drop-rate polling. Box result: countdown T-1000 +0ms, first poll T-995ms,
+  pool 12/12, ~200 polls all "not released", RTT p50 60ms, dense gap 19ms.
+- Preflight flags a player-names screen (allow_name_entry, parties >1) or a
+  Book Time reCAPTCHA (enable_captcha_online) — both OFF for Bethpage today.
+- Dashboard warns when an auto-arm near 7pm is only a Systems check.
+
+**Still for Isaac (blocked for Claude):** two stale launchd agents from August
+(`com.bethpage.sniper.aws.2026-08-09` — a LIVE arm; `com.bethpage.teetime.
+2026-08-09`) re-fire every Aug 2 (launchd ignores `Year`). Unload + move them.
+
+394 unit tests + 21 arm-timer checks pass; tsc clean; `verify --simulate-drop`
+READY on both machines for black + red (10-11-2026).

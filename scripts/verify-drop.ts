@@ -4,6 +4,7 @@
  *   npm run verify                      # courses from .env COURSE
  *   npm run verify -- --course black,red
  *   npm run verify -- --course black --date 10-11-2026
+ *   npm run verify -- --course black,red --simulate-drop     # + countdown rehearsal
  *
  * Runs unit tests + typecheck, then a turbo --dry-run --spec --race against
  * ET today+7 (tonight's drop date before 7pm), and grades
@@ -48,7 +49,8 @@ const lines: string[] = [];
 const replay = process.env.VERIFY_REPLAY; // grade a saved transcript offline (no ForeUp traffic)
 if (replay) lines.push(...require('fs').readFileSync(replay, 'utf8').split('\n').filter((l: string) => l.trim()));
 else await new Promise<void>((resolve) => {
-  const child = spawn('npx', ['tsx', 'src/turbo.ts', '--dry-run', '--spec', '--race', '--course', courses.join(','), '--date', date],
+  const simArgs = process.argv.includes('--simulate-drop') ? ['--simulate-drop', arg('simulate-drop') && /^\d+$/.test(arg('simulate-drop')!) ? arg('simulate-drop')! : '45'] : [];
+  const child = spawn('npx', ['tsx', 'src/turbo.ts', '--dry-run', '--spec', '--race', '--course', courses.join(','), '--date', date, ...simArgs],
     { cwd: root, env: { ...process.env, HEADLESS: process.env.HEADLESS ?? '1' } });
   const onData = (b: Buffer) => { for (const l of b.toString().split('\n')) if (l.trim()) { lines.push(l); console.log(`  │ ${l.trim()}`); } };
   child.stdout.on('data', onData);
@@ -70,6 +72,11 @@ add('ForeUp flow unchanged', has(/ForeUp preflight: (v[\d.]+, all \d+ flow marke
 add('clock synced (NTP or ForeUp)', has(/Clock offset: -?\d+ms/) && !has(/Clock offset: machine clock/), find(/Clock offset/));
 add('email (IMAP) ready', has(/IMAP ready|No email code needed/), find(/IMAP/));
 add('date is the drop date', !has(/DATE CHECK:/), find(/DATE CHECK/) ?? date);
+if (process.argv.includes('--simulate-drop') || has(/SIM DROP:/)) {
+  // The countdown, T-30 clock re-sync, warm-ups and drop-rate polling only run
+  // at a real release; this rehearsal executes that exact code read-only.
+  add('countdown rehearsal (simulated drop)', has(/✓ \[[^\]]*\] SIM DROP:/) && !has(/✗ \[[^\]]*\] SIM DROP:/), find(/[✓✗] \[[^\]]*\] SIM DROP:/));
+}
 add('dry run finished', has(/DRY RUN done\./));
 
 const spec = find(/DRY RUN SPEC|no safe predicted|SPEC: no in-window slot predictable/);

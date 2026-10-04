@@ -554,9 +554,18 @@
       const atD = new Date(s.at);
       const sameDay = atD.toDateString() === new Date().toDateString();
       const t = (sameDay ? '' : atD.toLocaleDateString('en-US', { weekday: 'short' }) + ' ') + atD.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-      box.innerHTML = `<span class="set">auto-arm set: ${MODE_LABEL[s.mode].replace('Arm ', '').replace('Run ', '')} at ${t}${s.courses ? ' · ' + s.courses.join('+') : ''}${s.spec ? ' · SPEC' : ' · detect-first'}${s.date ? ' · ' + s.date : ' · date auto (D+7 at run time)'}${s.target === 'oregon' ? ' · on GCP VM' : s.target === 'aws' ? ' · on AWS' : ''}</span> <button class="cancel" id="sched-cancel">Cancel</button>`;
+      box.innerHTML = `<span class="set">auto-arm set: ${MODE_LABEL[s.mode].replace('Arm ', '').replace('Run ', '')} at ${t}${s.courses ? ' · ' + s.courses.join('+') : ''}${s.spec ? ' · SPEC' : ' · detect-first'}${s.date ? ' · ' + s.date : ' · date auto (D+7 at run time)'}${s.target === 'oregon' ? ' · on GCP VM' : s.target === 'aws' ? ' · on AWS' : ''}${s.target === 'mac' ? '' : s.boxArmed ? ' · ✓ the box fires it itself' : ' · ⚠ this Mac must be awake to fire it'}${s.mode === 'dry' ? ' · ⚠ systems check only — will NOT race the drop' : ''}</span> <button class="cancel" id="sched-cancel">Cancel</button>`;
       $('schednote').style.display = '';
-      $('sched-cancel').onclick = async () => { await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cancel: true }) }); };
+      $('schednote').textContent = s.target === 'mac'
+        ? 'While an auto-arm is set, this page’s server keeps your Mac awake. Leave it running.'
+        : s.boxArmed
+          ? 'The box has its own timer for this run — it fires even if this Mac is asleep, closed or offline. To stop it, press Cancel here (that removes the box’s timer too).'
+          : 'The box could not be given its own timer, so this Mac has to arm it — keep the Mac awake and online until then.';
+      $('sched-cancel').onclick = async () => {
+        const b = $('sched-cancel'); b.disabled = true; b.textContent = 'Cancelling…';
+        const r = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cancel: true }) }).then((r) => r.json()).catch(() => ({ ok: false, error: 'The dashboard did not answer.' }));
+        if (!r.ok) { alert(r.error); b.disabled = false; b.textContent = 'Cancel'; }
+      };
     } else {
       box.innerHTML = `<span>or auto-arm</span> <select id="sched-day"><option value="today">today</option><option value="tomorrow">tomorrow</option></select> <span>at</span> <input type="time" id="sched-time" value="18:50"> <button id="sched-btn">Set</button>`;
       $('schednote').style.display = 'none';
@@ -565,8 +574,11 @@
   }
   function bindSchedBtn() {
     $('sched-btn').onclick = async () => {
+      const sb = $('sched-btn'); sb.disabled = true; sb.textContent = 'Setting…'; // a remote box is given its own timer — takes a few seconds
       const r = await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, time: $('sched-time').value, day: $('sched-day')?.value ?? 'today', courses, target, players, date: pickedDate(), spec }) }).then((r) => r.json());
+      if ($('sched-btn')) { $('sched-btn').disabled = false; $('sched-btn').textContent = 'Set'; }
       if (!r.ok) alert(r.error);
+      else if (r.warning) alert(r.warning);
     };
   }
   bindSchedBtn();

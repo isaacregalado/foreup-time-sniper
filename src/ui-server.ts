@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, execFile, type ChildProcess } from 'child_process';
 import { ImapFlow } from 'imapflow';
+import { armTimerCmd, attachCmd, cancelTimerCmd } from './remote-arm';
 
 const PORT = 4747;
 const ROOT = path.join(__dirname, '..');
@@ -115,9 +116,20 @@ const BETHPAGE_KEYS = ['red', 'green', 'black', 'blue', 'yellow'];
 const ALL_KEYS = [...BETHPAGE_KEYS, 'crab-meadow'];
 
 // ── auto-arm schedule + sleep protection ────────────────────
-let schedule: { mode: Mode; at: number; courses: string[] | null; target: Target; players?: number; date?: string; spec?: boolean } | null = null;
+interface Schedule { mode: Mode; at: number; courses: string[] | null; target: Target; players?: number; date?: string; spec?: boolean; boxArmed?: boolean }
+let schedule: Schedule | null = null;
 let scheduleTimer: NodeJS.Timeout | null = null;
 let caffeinateProc: ChildProcess | null = null;
+// The schedule survives a dashboard restart (it used to live only in memory —
+// a restart or re-sync silently dropped tonight's arm).
+const SCHEDULE_PATH = path.join(ROOT, 'logs', 'schedule.json');
+// An auto-arm that fires this late is not the run that was asked for: starting
+// it could race a sheet released long ago (or re-book after a finished run).
+const STALE_ARM_MS = 5 * 60_000;
+// A remote schedule is started by the BOX's own timer; the Mac attaches a few
+// seconds later so it only ever attaches to that run instead of racing to
+// create a second one.
+const REMOTE_ATTACH_DELAY_MS = 4000;
 
 /** Keep the Mac awake whenever a run is live OR an auto-arm is pending —
  *  a sleeping laptop at 6:58pm is the dumbest way to lose. */
@@ -133,33 +145,202 @@ function updateCaffeinate() {
   }
 }
 
-function setSchedule(mode: Mode, hhmm: string, courses: string[] | null, target: Target, players?: number, date?: string, day: 'today' | 'tomorrow' = 'today', spec?: boolean): { ok: boolean; error?: string } {
+function validateCourses(courses?: string[] | null): string | null {
+  if (!courses) return null;
+  if (!courses.length || courses.some((c) => !ALL_KEYS.includes(c))) return 'Unknown course selection.';
+  if (courses.includes('crab-meadow') && courses.length > 1) return 'Crab Meadow is a separate facility — book it alone.';
+  return null;
+}
+
+/** turbo.ts flags for a run — shared by "arm now" and the box-side timer. */
+function turboFlagsFor(mode: Mode, date?: string, courses?: string[], players?: number, spec?: boolean): string[] {
+  const turboFlags: string[] = [];
+  turboFlags.push('--race'); // the only supported drop mode — never depend on .env RACE=1
+  if (mode === 'test') turboFlags.push('--no-book');
+  if (mode === 'dry') turboFlags.push('--dry-run');
+  if (date) turboFlags.push('--date', date);
+  if (courses?.length) turboFlags.push('--course', courses.join(','));
+  if (players && Number.isInteger(players) && players >= 1 && players <= 4) turboFlags.push('--players', String(players));
+  if (spec) turboFlags.push('--spec');
+  return turboFlags;
+}
+
+/** The command a remote box runs. Remote boxes never have a display server:
+ *  headless mode is an invariant of the generated command instead of relying
+ *  on a VM-specific .env value that a Mac-to-VM config sync can overwrite. */
+function remoteRunCmd(mode: Mode, turboFlags: string[]): string {
+  const envPrefix = `HEADLESS=1 ${mode === 'live' ? 'AUTO_BOOK=1 ' : ''}`;
+  return `${envPrefix}npx tsx src/turbo.ts ${turboFlags.join(' ')}`.trim();
+}
+
+/** Run one short command on a remote box; resolves with its combined output. */
+async function remoteExec(target: 'aws' | 'oregon', cmd: string, timeoutMs = 25_000): Promise<{ ok: boolean; out: string }> {
+  let bin = 'gcloud';
+  let args = [...VM_SSH_ARGS, '--command', cmd];
+  if (target === 'aws') {
+    if (!fs.existsSync(AWS_KEY)) return { ok: false, out: `AWS key missing (${AWS_KEY})` };
+    const { status, ip } = await awsStatus();
+    if (status !== 'running' || !ip) return { ok: false, out: `AWS box is ${status}` };
+    bin = 'ssh';
+    args = [...AWS_SSH_OPTS, `${AWS_BOX.user}@${ip}`, cmd];
+  }
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+      resolve({ ok: !err, out: `${stdout}${stderr}`.trim() });
+    });
+  });
+}
+
+/** Give the box its own timer for this schedule: a detached tmux session
+ *  ('armtimer') that sleeps until the arm time and then BECOMES the 'snipe'
+ *  run session — exactly what a dashboard arm would have created. From then on
+ *  the run needs nothing from this Mac: asleep, offline or closed, the box
+ *  still fires. tmux session names are unique, so if a run is already live at
+ *  that moment the rename fails and nothing starts twice. ('armtimer' is not
+ *  a prefix of 'snipe': tmux -t does prefix matching.) */
+async function placeRemoteSchedule(s: Schedule): Promise<{ ok: boolean; error?: string }> {
+  if (!IS_MAC || s.target === 'mac') return { ok: false };
+  const runCmd = remoteRunCmd(s.mode, turboFlagsFor(s.mode, s.date, s.courses ?? undefined, s.players, s.spec));
+  const cmd = armTimerCmd(s.at, runCmd);
+  const r = await remoteExec(s.target, cmd);
+  return r.ok && r.out.includes('ARMTIMER_OK') ? { ok: true } : { ok: false, error: r.out.split('\n').pop() || 'no response from the box' };
+}
+
+/** Remove the box's timer. Must be CONFIRMED: a cancel that silently failed
+ *  would leave a (possibly real-money) run armed on the box. */
+async function cancelRemoteSchedule(target: 'aws' | 'oregon', alsoRun = false): Promise<{ ok: boolean; error?: string }> {
+  // alsoRun: the timer may have fired seconds ago and already become the run
+  // session — a cancel pressed in that window must stop the run it started.
+  const r = await remoteExec(target, cancelTimerCmd(alsoRun));
+  return r.out.includes('ARMTIMER_GONE') ? { ok: true } : { ok: false, error: r.out.split('\n').pop() || 'no response from the box' };
+}
+
+function persistSchedule() {
+  try {
+    if (schedule) {
+      fs.mkdirSync(path.dirname(SCHEDULE_PATH), { recursive: true });
+      fs.writeFileSync(SCHEDULE_PATH, JSON.stringify(schedule));
+    } else if (fs.existsSync(SCHEDULE_PATH)) fs.unlinkSync(SCHEDULE_PATH);
+  } catch { /* persistence is best-effort; the in-memory schedule still works */ }
+}
+
+/** The auto-arm fires. A box-armed remote schedule is only ATTACHED to (the
+ *  box started it; if this Mac slept through it, the finished log is replayed
+ *  so the verdict still shows). Anything else starts the run here — unless it
+ *  is firing too late to be the run that was asked for. */
+function fireSchedule(s: Schedule) {
+  const lateMs = Date.now() - s.at;
+  const when = new Date(s.at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  if (state.running) return;
+  const report = (r: { ok: boolean; error?: string }) => {
+    if (r.ok) return;
+    const msg = s.boxArmed
+      ? `Could not attach to the box at ${when} (${r.error}) — the box's own timer still ran the scheduled run; press Arm to view it once the box is reachable.`
+      : `Auto-arm at ${when} failed: ${r.error}`;
+    state.statusText = msg;
+    state.lines.push(`  ✗ ${msg}`);
+    broadcast('line', { line: `  ✗ ${msg}`, phase: state.phase, statusText: msg });
+  };
+  if (s.target !== 'mac' && s.boxArmed) {
+    void arm(s.mode, s.date, s.courses ?? undefined, s.target, s.players, s.spec, { schedAt: s.at, allowCreate: lateMs < STALE_ARM_MS }).then(report);
+  } else if (lateMs < STALE_ARM_MS) {
+    void arm(s.mode, s.date, s.courses ?? undefined, s.target, s.players, s.spec, {}).then(report);
+  } else {
+    state.statusText = `Auto-arm for ${when} was missed (this Mac was asleep or the dashboard was down) — nothing was started.`;
+    state.lines.push(`  ✗ ${state.statusText}`);
+    broadcast('line', { line: `  ✗ ${state.statusText}`, phase: state.phase, statusText: state.statusText });
+  }
+}
+
+function startScheduleTimer() {
+  if (!schedule) return;
+  if (scheduleTimer) clearTimeout(scheduleTimer);
+  const fireAt = schedule.at + (schedule.target !== 'mac' ? REMOTE_ATTACH_DELAY_MS : 0);
+  scheduleTimer = setTimeout(() => {
+    const s = schedule;
+    schedule = null; scheduleTimer = null;
+    persistSchedule();
+    if (s) fireSchedule(s);
+    updateCaffeinate();
+    broadcast('schedule', { schedule: null });
+  }, Math.max(0, fireAt - Date.now()));
+}
+
+async function setSchedule(mode: Mode, hhmm: string, courses: string[] | null, target: Target, players?: number, date?: string, day: 'today' | 'tomorrow' = 'today', spec?: boolean): Promise<{ ok: boolean; error?: string; boxArmed?: boolean; warning?: string }> {
   const m = hhmm.match(/^(\d{1,2}):(\d{2})$/);
   if (!m) return { ok: false, error: 'Time must look like 18:50.' };
+  const bad = validateCourses(courses); // these values are embedded in a remote command — validate first
+  if (bad) return { ok: false, error: bad };
   const at = new Date();
   if (day === 'tomorrow') at.setDate(at.getDate() + 1);
   at.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
   if (at.getTime() <= Date.now() + 5000) return { ok: false, error: 'That time has already passed today.' };
   if (at.getTime() > Date.now() + 36 * 3600_000) return { ok: false, error: 'Auto-arm reaches at most ~36h out.' };
-  clearSchedule();
+  const cleared = await clearSchedule();
+  if (!cleared.ok) return { ok: false, error: `Could not cancel the previous auto-arm on the box (${cleared.error}) — it is still armed there. Try again.` };
   schedule = { mode, at: at.getTime(), courses, target, players, date, spec };
-  scheduleTimer = setTimeout(() => {
-    const s = schedule;
-    schedule = null; scheduleTimer = null;
-    if (s && !state.running) void arm(s.mode, s.date, s.courses ?? undefined, s.target, s.players, s.spec);
-    updateCaffeinate();
-    broadcast('schedule', { schedule: null });
-  }, at.getTime() - Date.now());
+  let warning: string | undefined;
+  if (IS_MAC && target !== 'mac') {
+    const placed = await placeRemoteSchedule(schedule);
+    schedule.boxArmed = placed.ok;
+    if (!placed.ok) warning = `Could not give the ${target === 'aws' ? 'AWS box' : 'GCP VM'} its own timer (${placed.error ?? 'unreachable'}). This Mac will arm it at the set time instead — keep the Mac awake.`;
+  }
+  // The easiest way to lose a drop: the mode was still on "Systems check"
+  // when the auto-arm was set. A check at 6:50pm finishes in a minute and
+  // nothing races at 7:00.
+  const hm = at.getHours() * 60 + at.getMinutes();
+  if (mode === 'dry' && hm >= 18 * 60 && hm < 19 * 60) {
+    const note = 'Heads up: this auto-arm is a SYSTEMS CHECK. It only tests the setup — nothing will race the 7:00pm drop. To go for a tee time, cancel it, pick "Real booking" (or "Test run — $0") and set the auto-arm again.';
+    warning = warning ? `${warning}\n\n${note}` : note;
+  }
+  persistSchedule();
+  startScheduleTimer();
   updateCaffeinate();
   broadcast('schedule', { schedule: publicSchedule() });
-  return { ok: true };
+  return { ok: true, boxArmed: !!schedule.boxArmed, warning };
 }
-function clearSchedule() {
+
+/** Clear the pending auto-arm. For a box-armed schedule the box's timer is
+ *  removed FIRST and must be confirmed gone; otherwise nothing changes. */
+async function clearSchedule(): Promise<{ ok: boolean; error?: string }> {
+  if (schedule?.boxArmed && schedule.target !== 'mac') {
+    const r = await cancelRemoteSchedule(schedule.target, Date.now() >= schedule.at - 2000);
+    if (!r.ok) return r;
+  }
   if (scheduleTimer) clearTimeout(scheduleTimer);
   schedule = null; scheduleTimer = null;
+  persistSchedule();
   updateCaffeinate();
+  return { ok: true };
 }
-const publicSchedule = () => schedule ? { mode: schedule.mode, at: new Date(schedule.at).toISOString(), courses: schedule.courses, target: schedule.target, players: schedule.players ?? null, date: schedule.date ?? null, spec: schedule.spec ?? false } : null;
+const publicSchedule = () => schedule ? { mode: schedule.mode, at: new Date(schedule.at).toISOString(), courses: schedule.courses, target: schedule.target, players: schedule.players ?? null, date: schedule.date ?? null, spec: schedule.spec ?? false, boxArmed: !!schedule.boxArmed } : null;
+
+/** After a dashboard restart: pick the saved auto-arm back up. Future → re-arm
+ *  the timer (and re-place the box's timer, which is idempotent). Past →
+ *  fireSchedule decides (attach to the box's run, start if only minutes late,
+ *  or report it missed). */
+async function restoreSchedule() {
+  let saved: Schedule | null = null;
+  try { saved = JSON.parse(fs.readFileSync(SCHEDULE_PATH, 'utf-8')); } catch { return; }
+  if (!saved || typeof saved.at !== 'number' || !['test', 'live', 'dry'].includes(saved.mode) || validateCourses(saved.courses)) { schedule = null; persistSchedule(); return; }
+  if (Date.now() - saved.at > 6 * 3600_000) { schedule = null; persistSchedule(); return; } // ancient — drop it
+  schedule = saved;
+  if (saved.at > Date.now()) {
+    if (IS_MAC && saved.target !== 'mac') {
+      const placed = await placeRemoteSchedule(saved);
+      if (schedule === saved) { saved.boxArmed = placed.ok || !!saved.boxArmed; persistSchedule(); }
+    }
+    if (schedule !== saved) return; // changed while we were talking to the box
+    startScheduleTimer();
+    updateCaffeinate();
+    broadcast('schedule', { schedule: publicSchedule() });
+    console.log(`  ↻ restored auto-arm: ${saved.mode} at ${new Date(saved.at).toLocaleString()} on ${saved.target}${saved.boxArmed ? ' (box has its own timer)' : ''}`);
+  } else {
+    schedule = null;
+    persistSchedule();
+    fireSchedule(saved);
+  }
+}
 
 // Log-line → phase + plain English. First match wins; order matters.
 const PHASE_MAP: Array<{ re: RegExp; phase: Phase; text: (m: RegExpMatchArray) => string }> = [
@@ -210,6 +391,7 @@ function broadcast(event: string, data: unknown) {
 function ingestLine(raw: string) {
   const line = raw.trimEnd();
   if (!line.trim()) return;
+  if (/^# armtimer \d+$/.test(line)) return; // the box timer's own marker, not run output
   state.lines.push(line);
   if (state.lines.length > 400) state.lines.shift();
   let hitTerminal = false;
@@ -266,7 +448,7 @@ function dryDetail(): string {
   const base = `Checked on ${where}: login, clock, email and tee-sheet access all work. Nothing was held or charged.`;
   const clean = (l: string) => l.replace(/^\s*[✗⚠✓ℹ…]\s*(\[[^\]]*\]\s*)?/, '').slice(0, 140);
   const problems = state.lines
-    .filter((l) => /API detector unhealthy|DATE CHECK|detector poll (rejected|blocked)|Clock offset: machine clock|could not be staged|Bridge preflight|flow markers MISSING/.test(l))
+    .filter((l) => /API detector unhealthy|DATE CHECK|detector poll (rejected|blocked)|Clock offset: machine clock|could not be staged|Bridge preflight|flow markers MISSING|IMAP not connected|✗ .*SIM DROP/.test(l))
     .slice(0, 3)
     .map(clean);
   const specOff = state.lines.some((l) => /spec disabled|no safe predicted/.test(l));
@@ -308,13 +490,11 @@ function finalizeRun(code: number | null) {
   updateCaffeinate();
 }
 
-async function arm(mode: Mode, date?: string, courses?: string[], target: Target = 'mac', players?: number, spec?: boolean): Promise<{ ok: boolean; error?: string }> {
+async function arm(mode: Mode, date?: string, courses?: string[], target: Target = 'mac', players?: number, spec?: boolean, sched: { schedAt?: number; allowCreate?: boolean } = {}): Promise<{ ok: boolean; error?: string }> {
   if (state.running) return { ok: false, error: 'A run is already armed. Disarm it first.' };
   if (syncChild) return { ok: false, error: 'A sync is in progress — wait for it to finish.' };
-  if (courses) {
-    if (!courses.length || courses.some((c) => !ALL_KEYS.includes(c))) return { ok: false, error: 'Unknown course selection.' };
-    if (courses.includes('crab-meadow') && courses.length > 1) return { ok: false, error: 'Crab Meadow is a separate facility — book it alone.' };
-  }
+  const badCourses = validateCourses(courses);
+  if (badCourses) return { ok: false, error: badCourses };
   if (target !== 'mac' && !IS_MAC) {
     return { ok: false, error: 'This dashboard IS a remote box — use the "This VM" machine.' };
   }
@@ -324,14 +504,7 @@ async function arm(mode: Mode, date?: string, courses?: string[], target: Target
     if (!cs.present) return { ok: false, error: 'A headless run books fully automatically and needs the booking-fee card: fill FEE_CARD_* in .env (then "Sync → VM" if arming from the Mac).' };
     if (!cs.valid) return { ok: false, error: `Card looks wrong: ${cs.issues.join('; ')}. Fix FEE_CARD_* in .env before an auto-book run.` };
   }
-  const turboFlags: string[] = [];
-  turboFlags.push('--race'); // the only supported drop mode — never depend on .env RACE=1
-  if (mode === 'test') turboFlags.push('--no-book');
-  if (mode === 'dry') turboFlags.push('--dry-run');
-  if (date) turboFlags.push('--date', date);
-  if (courses?.length) turboFlags.push('--course', courses.join(','));
-  if (players && Number.isInteger(players) && players >= 1 && players <= 4) turboFlags.push('--players', String(players));
-  if (spec) turboFlags.push('--spec');
+  const turboFlags = turboFlagsFor(mode, date, courses, players, spec);
 
   if (target === 'oregon' || target === 'aws') {
     // Headless remote run, tmux-hardened: turbo lives in a detached tmux session
@@ -339,16 +512,13 @@ async function arm(mode: Mode, date?: string, courses?: string[], target: Target
     // session ends. If the ssh drops (Mac sleep, wifi blip) the run SURVIVES —
     // pressing Arm again reattaches to it (the has-session guard) and replays
     // the log from the top so the dashboard reconstructs the right state.
-    // Remote boxes never have a display server. Make headless mode an
-    // invariant of the generated command instead of relying on a VM-specific
-    // .env value that can be overwritten by a Mac-to-VM config sync.
-    const envPrefix = `HEADLESS=1 ${mode === 'live' ? 'AUTO_BOOK=1 ' : ''}`;
-    const runCmd = `${envPrefix}npx tsx src/turbo.ts ${turboFlags.join(' ')}`.trim();
-    const remoteCmd =
-      `cd ~/bethpage-sniper; mkdir -p logs; ` +
-      `if ! tmux has-session -t snipe 2>/dev/null; then rm -f logs/live-run.log; tmux new-session -d -s snipe '${runCmd} > logs/live-run.log 2>&1'; fi; ` +
-      `touch logs/live-run.log; tail -n +1 -F logs/live-run.log & TP=$!; ` +
-      `while tmux has-session -t snipe 2>/dev/null; do sleep 2; done; sleep 2; kill $TP 2>/dev/null; true`;
+    const runCmd = remoteRunCmd(mode, turboFlags);
+    // A box-armed schedule was (or is being) started by the box's own timer.
+    // Then this Mac only ATTACHES — live if the run is still going, a full
+    // replay if it already finished — and never starts a second run. Creating
+    // one here is the fallback for a box that did not start it, and only
+    // while the arm is not stale. ("Arm now" passes no schedAt: start-or-attach.)
+    const remoteCmd = attachCmd(runCmd, sched);
     if (target === 'aws') {
       if (!fs.existsSync(AWS_KEY)) return { ok: false, error: `AWS key missing (${AWS_KEY}) — run deploy/aws-setup.sh once from this Mac.` };
       const { status, ip } = await awsStatus();
@@ -680,7 +850,14 @@ const server = http.createServer(async (req, res) => {
     json(res, 200, readHistory());
   } else if (req.method === 'POST' && url === '/api/schedule') {
     const body = await readBody(req);
-    if (body.cancel) { clearSchedule(); broadcast('schedule', { schedule: null }); json(res, 200, { ok: true }); return; }
+    if (body.cancel) {
+      const wasBox = !!schedule?.boxArmed;
+      const r = await clearSchedule();
+      if (!r.ok) { json(res, 200, { ok: false, error: `Could not reach the box to cancel its timer (${r.error}). The run is STILL ARMED there — try Cancel again.` }); return; }
+      broadcast('schedule', { schedule: null });
+      json(res, 200, { ok: true, boxCancelled: wasBox });
+      return;
+    }
     const mode: Mode = ['test', 'live', 'dry'].includes(body.mode) ? body.mode : 'test';
     const target: Target = body.target === 'oregon' ? 'oregon' : body.target === 'aws' ? 'aws' : 'mac';
     if (target !== 'mac' && mode === 'live') {
@@ -693,7 +870,7 @@ const server = http.createServer(async (req, res) => {
     const schedDate = typeof body.date === 'string' && /^\d{2}-\d{2}-\d{4}$/.test(body.date) ? body.date : undefined;
     const schedDay = body.day === 'tomorrow' ? 'tomorrow' as const : 'today' as const;
     const schedSpec = body.spec === true;
-    json(res, 200, setSchedule(mode, String(body.time ?? ''), courses, target, schedPlayers, schedDate, schedDay, schedSpec));
+    json(res, 200, await setSchedule(mode, String(body.time ?? ''), courses, target, schedPlayers, schedDate, schedDay, schedSpec));
   } else if (req.method === 'GET' && url === '/api/stream') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     res.write(`event: hello\ndata: ${JSON.stringify(state)}\n\n`);
@@ -721,4 +898,5 @@ setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 25_00
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n  ⛳  Turbo Sniper UI → http://localhost:${PORT}\n`);
   if (process.platform === 'darwin' && !process.env.NO_OPEN) execFile('open', [`http://localhost:${PORT}`], () => {});
+  void restoreSchedule();
 });

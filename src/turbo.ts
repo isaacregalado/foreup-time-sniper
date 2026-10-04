@@ -35,7 +35,7 @@
  *      make continue book directly)
  *   5. card-window amount must equal $5 × players before any card fill
  */
-import { chromium, type Page, type BrowserContext, type FrameLocator } from 'playwright';
+import { chromium, type Browser, type Page, type BrowserContext, type FrameLocator } from 'playwright';
 import { EmailMonitor } from './email-monitor';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
@@ -54,7 +54,9 @@ import {
   pollPhase,
   poolWarmSockets,
   specRunMode,
+  vulturePollDelayMs,
   vultureRetryDelayMs,
+  VULTURE_FAST_PHASE_MS,
   type ModalIdentityMismatch,
   type PollKind,
 } from './turbo-guards';
@@ -174,6 +176,14 @@ const DRY_RUN = process.argv.includes('--dry-run');
 // freshly released sheet — the only source of real MORNING rows and fees,
 // which is what lets SPEC price a weekend morning. Zero holds.
 const CAPTURE_DROP = process.argv.includes('--capture-drop');
+// Read-only countdown rehearsal (with --dry-run): pretend the release is N
+// seconds away (default 45, min 35 so the T-30 re-sync runs) and execute the
+// REAL wait loop + poll schedule against the target sheet. Polls only.
+const SIM_DROP_LEAD_S: number | null = (() => {
+  if (!process.argv.includes('--simulate-drop')) return null;
+  const n = parseInt(cliArg('simulate-drop') ?? '', 10);
+  return Number.isFinite(n) ? Math.max(35, Math.min(600, n)) : 45;
+})();
 const ABORT_BEFORE_BOOK = process.argv.includes('--no-book'); // click tile + verify modal, then close at $0
 // Full $0 checkout rehearsal: consume the email code, validate the $5/player
 // amount, fill every card field, then explicitly DELETE the pending hold.
@@ -832,7 +842,7 @@ async function stagePage(page: Page, course: CourseCfg, date: string, players = 
 // flow-shape probe for the bridge hold; costs nothing server-side.
 const bridgePreflightEval = () => {
   const w = window as any;
-  const out = { reachable: false, release: false, checkout: false, captcha: false, bagBusy: false, err: '' };
+  const out = { reachable: false, release: false, checkout: false, captcha: false, bagBusy: false, nameEntry: false, captchaOnline: false, err: '' };
   try {
     const tiles = w.App && w.App.page && w.App.page.currentView && w.App.page.currentView.content && w.App.page.currentView.content.currentView;
     const TileClass = tiles && (typeof tiles.getItemView === 'function' ? tiles.getItemView() : (tiles.itemView || tiles.childView));
@@ -848,6 +858,14 @@ const bridgePreflightEval = () => {
     out.captcha = !!(w.Feature && w.Feature.isActive && w.Feature.isActive('2024-10-phoenix-PHX-557-force-recaptcha-on-tile-click'));
     const bag = w.onlineBookingVueFactory && w.onlineBookingVueFactory.dataStore && w.onlineBookingVueFactory.dataStore.getters;
     out.bagBusy = !!(bag && bag['bag/getNumTeeTimesInBag'] > 0);
+    // After "Book Time", ForeUp shows PlayerNameEntryView instead of Payment
+    // Method when the booking class allows name entry and players > 1, and it
+    // runs an invisible reCAPTCHA first when enable_captcha_online is set.
+    // Either would stall the mapped checkout — both are OFF for Bethpage
+    // (verified through 2026-10-04); this makes a change loud before a drop.
+    out.nameEntry = !!(w.App.settings && w.App.settings.allow_name_entry);
+    const cap = w.SETTINGS && w.SETTINGS.enable_captcha_online; // the page normalizes "0"/"1" to a boolean; accept either form
+    out.captchaOnline = cap === true || cap === 1 || cap === '1';
   } catch (e) { out.err = String(e); }
   return out;
 };
@@ -859,9 +877,10 @@ const bridgePreflightEval = () => {
 async function bridgePreflight(page: Page, course: CourseCfg): Promise<void> {
   if (BRIDGE_OFF) return;
   const p = await page.evaluate(bridgePreflightEval)
-    .catch((e) => ({ reachable: false, release: false, checkout: false, captcha: false, bagBusy: false, err: String(e) }));
+    .catch((e) => ({ reachable: false, release: false, checkout: false, captcha: false, bagBusy: false, nameEntry: false, captchaOnline: false, err: String(e) }));
   tev('bridge_preflight', { course: course.key, ...p });
-  if (p.reachable && p.release && !p.checkout && !p.captcha && !p.bagBusy) {
+  const namesBlock = p.nameEntry && cfg.players > 1;
+  if (p.reachable && p.release && !p.checkout && !p.captcha && !p.bagBusy && !namesBlock && !p.captchaOnline) {
     log('✓', `Bridge ready on ${course.name}: modern tile view + exact release helper reachable, Backbone modal flow confirmed`);
     return;
   }
@@ -870,10 +889,40 @@ async function bridgePreflight(page: Page, course: CourseCfg): Promise<void> {
   if (p.checkout) log('⚠', `Bridge preflight ${course.name}: ForeUp enabled the NEW checkout flow — modal gates need re-mapping before trusting a real run`);
   if (p.captcha) log('⚠', `Bridge preflight ${course.name}: ForeUp enabled captcha-on-click — expect human intervention, do not rely on auto-book`);
   if (p.bagBusy) log('⚠', `Bridge preflight ${course.name}: a tee time is already in the account's bag — viewTime will refuse; empty the bag first`);
+  if (namesBlock) log('⚠', `Bridge preflight ${course.name}: ForeUp now asks for player names before payment for parties over 1 — the mapped checkout would stall after "Book Time"; re-map it (or book 1 player) before a real run`);
+  if (p.captchaOnline) log('⚠', `Bridge preflight ${course.name}: ForeUp enabled reCAPTCHA at "Book Time" — a headless auto-book may stop for a human`);
 }
 
-async function bootstrap(date: string): Promise<{ context: BrowserContext; pages: Map<string, Page>; userId: number }> {
+type Bootstrapped = { context: BrowserContext; pages: Map<string, Page>; userId: number };
+
+/** Launch + log in + stage every course. On any failure the browser is closed
+ *  so a retry starts clean instead of leaking a half-staged Chromium. */
+async function bootstrap(date: string): Promise<Bootstrapped> {
   const browser = await chromium.launch({ headless: !!process.env.HEADLESS, args: ['--disable-blink-features=AutomationControlled'] });
+  try {
+    return await bootstrapIn(browser, date);
+  } catch (e) {
+    await browser.close().catch(() => {});
+    throw e;
+  }
+}
+
+/** A transient failure at arm time (page-load timeout, slow login, one bad
+ *  response) must not cost the whole drop: retry in a fresh browser. */
+async function bootstrapWithRetry(date: string, attempts = 3): Promise<Bootstrapped> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await bootstrap(date);
+    } catch (e) {
+      if (attempt >= attempts) throw e;
+      log('⚠', `Browser bootstrap failed (attempt ${attempt}/${attempts}): ${(e as Error).message.split('\n')[0]} — retrying in 3s`);
+      tev('bootstrap_retry', { attempt, err: String((e as Error)?.message ?? e).slice(0, 200) });
+      await sleep(3000);
+    }
+  }
+}
+
+async function bootstrapIn(browser: Browser, date: string): Promise<Bootstrapped> {
   const hasSession = fs.existsSync(SESSION_PATH);
   const context = hasSession
     ? await browser.newContext({ storageState: JSON.parse(fs.readFileSync(SESSION_PATH, 'utf-8')), userAgent: CHROME_UA })
@@ -1301,26 +1350,11 @@ async function completeBooking(
     return await closeModal(page) ? 'test_passed' : 'manual_needed';
   }
 
-  // 5. The emailed code (Bethpage schedules). Sent automatically on tile click.
-  if (course.emailCode) {
-    // Red/Green can both hold briefly, generating two auto-emails. Once the
-    // loser DELETE is verified, reset the mailbox baseline and request one
-    // fresh winner code. EmailMonitor additionally requires this date+time
-    // and scans newest-first; course is not present in ForeUp's email body.
-    const baselineReady = await email.ensureFreshBaseline(6000).then(() => true).catch(() => false);
-    const resend = page.locator('button.js-reservation-confirmation-resend-button');
-    const resent = baselineReady && await resend.click().then(() => true).catch(() => false);
-    if (!resent) {
-      log('✗', 'Could not establish a fresh winner-only email baseline/resend — finish by hand in the browser.');
-      return 'manual_needed';
-    }
-    log('…', 'Waiting for the fresh winner booking code via IMAP (matched by date + time)…');
-  }
-
-  // 6. First "Book Time" — $0 with a booking fee: it opens Payment Method.
-  //    (For no-fee schedules like Crab Meadow this click BOOKS — stop first.)
+  // 5 + 6. The emailed code, then the first "Book Time".
+  //
+  // No-fee schedules (Crab Meadow) have no code and no fee window: the
+  // js-book-button click is the final act, so stop (or auto-book) right here.
   if (!course.emailCode) {
-    // Crab Meadow path: no fee window mapped; js-book-button is the final act.
     if (AUTO_BOOK) {
       await bookBtn.click();
       log('✓', `AUTO-BOOKED ${course.name} ${tLabel} (no-fee schedule) — check the confirmation email`);
@@ -1332,45 +1366,159 @@ async function completeBooking(
     return 'ready';
   }
 
-  // The code email names date + time but not the course. When Red and Green
-  // both held the same slot, the released loser's code can arrive first and
-  // look identical, so a code ForeUp rejects is excluded and the next matching
-  // one is tried (bounded: 3 distinct codes). A wrong code is refused by
-  // ForeUp's own validation before Payment Method — it can never charge.
+  // How ForeUp's code step works (read from online-booking v19.0.13 and proven
+  // by the 2026-10-04 $0 payment rehearsal): opening the modal POSTs
+  // createConfirmation, which emails a code; the "Resend Code" button POSTs it
+  // again and emails a DIFFERENT code. "Book Time" ($0 here — it opens Payment
+  // Method) validates the entered code server-side and writes any refusal
+  // into #booking-error. An upfront resend therefore races two codes half a
+  // second apart, and that flow failed its first live run. So:
+  //   - use the code ForeUp already sent (what the July booking proved),
+  //   - read ForeUp's answer instead of guessing,
+  //   - try the next matching code only when ForeUp refused one (Red and Green
+  //     holding the same date+time produce look-alike emails),
+  //   - ask for a fresh code only if none arrives or all were refused.
+  // A wrong code is refused before Payment Method — it can never charge.
+
+  /** Reset the mailbox baseline, then ask ForeUp for one fresh code for THIS
+   *  hold. Two attempts: an IMAP reconnect or a late-painting modal gets one
+   *  more chance, each step bounded so it cannot eat the 5-minute hold. */
+  const requestFreshCode = async (): Promise<boolean> => {
+    const resend = page.locator('button.js-reservation-confirmation-resend-button');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const baselineReady = await email.ensureFreshBaseline(6000).then(() => true).catch(() => false);
+      if (baselineReady && await resend.click({ timeout: 8000 }).then(() => true).catch(() => false)) return true;
+      if (attempt === 0) await sleep(2000);
+    }
+    return false;
+  };
+
+  /** Click "Book Time" once and wait for ForeUp's answer: Payment Method
+   *  (accepted) or the #booking-error text (refused). */
+  const bookOnce = async (): Promise<{ onPayment: boolean; error: string }> => {
+    // A hidden #booking-error keeps its old text; clear it so only THIS click's answer is read.
+    await page.evaluate(`(() => { const el = document.querySelector('#booking-error'); if (el) { el.textContent = ''; el.style.display = 'none'; } })()`).catch(() => {});
+    await bookBtn.click({ timeout: 5000 }).catch(() => {});
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (await page.locator('#payment_selection').isVisible().catch(() => false)) return { onPayment: true, error: '' };
+      const err = String(await page.evaluate(`(() => { const el = document.querySelector('#booking-error'); return el ? (el.textContent || '').trim() : ''; })()`).catch(() => '') || '');
+      if (err) return { onPayment: false, error: err };
+      await sleep(150);
+    }
+    return { onPayment: false, error: '' };
+  };
+
+  // Failed responses during the code step are evidence if it stalls (path +
+  // status + the server's message only — never the request).
+  const failedResponses: string[] = [];
+  const onCheckoutResponse = (r: { status(): number; url(): string; text(): Promise<string> }) => {
+    if (r.status() < 400) return;
+    const where = (() => { try { return new URL(r.url()).pathname.replace(/\d{6,}/g, '#'); } catch { return 'unknown'; } })();
+    r.text().then((body) => { failedResponses.push(`${r.status()} ${where} ${body.replace(/\s+/g, ' ').slice(0, 160)}`); }).catch(() => { failedResponses.push(`${r.status()} ${where}`); });
+  };
+  page.on('response', onCheckoutResponse);
+
   const expectedEmail = { dateMdY: date, time24: cand.t.time.split(' ')[1] ?? '' };
   const triedCodes = new Set<string>();
   const codeInput = page.locator('#reservation_confirmation_uid');
   let onPayment = false;
-  // Only another hold at this same time (other course, or an earlier attempt)
-  // can produce a look-alike code; otherwise a stalled page is not a wrong
-  // code, and waiting for a second one would only delay the hand-off.
-  const sameTimeElsewhere = [...raceAttempted].some((k) => k.endsWith(`|${cand.t.time}`) && k !== `${cand.course.key}|${cand.t.time}`);
-  const maxCodes = sameTimeElsewhere ? 3 : 1;
-  for (let codeTry = 0; codeTry < maxCodes && !onPayment; codeTry++) {
-    const code = await email.waitForBookingCode(codeTry === 0 ? 70_000 : 30_000, expectedEmail, triedCodes).catch(() => null);
-    if (!code) break;
-    triedCodes.add(code);
-    log('✓', `Code via IMAP: ***${code.slice(-2)}${codeTry ? ` (candidate ${codeTry + 1}; the previous code was rejected)` : ''}`);
-    tev('code_received', { candidate: codeTry + 1 });
-    await codeInput.fill(code).catch(() => {});
-    // ForeUp's Backbone model only picks the code up from a change event —
-    // fill() alone leaves the model empty (live-verified validation error).
-    await codeInput.dispatchEvent('change').catch(() => {});
-    log('✓', 'Code entered in browser');
-    for (let attempt = 0; attempt < 2 && !onPayment; attempt++) {
-      await bookBtn.click().catch(() => {});
-      onPayment = await page.locator('#payment_selection').waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
-      // Most likely the code didn't commit — refire change and retry once.
-      if (!onPayment) await codeInput.dispatchEvent('change').catch(() => {});
+  let lastBookError = '';
+  let codeSeen = false;
+  log('…', 'Waiting for the booking code via IMAP (matched by date + time)…');
+  // Round 1 uses the code ForeUp sent when the modal opened: the pre-drop
+  // mailbox baseline is still valid, so nothing is resent. (Only a dead IMAP
+  // session forces a reconnect — which re-baselines and could skip an email
+  // that already arrived — so then a fresh code is requested at once.)
+  // Round 2 requests a fresh code if none came or every one was refused; the
+  // hold still has minutes. Worst case ≈ 45s + 60s + checkout, inside 5 min.
+  for (let round = 0; round < 2 && !onPayment; round++) {
+    if (round === 1 || !email.isHealthy()) {
+      const why = round === 0 ? 'the IMAP session was down' : codeSeen ? 'ForeUp did not accept a code' : 'no code email arrived';
+      log('⚠', `Requesting a fresh code — ${why} (the hold has minutes left)`);
+      tev('code_resend', { round: round + 1, why });
+      if (!(await requestFreshCode())) {
+        log('⚠', 'Could not request a fresh code (mailbox or Resend button unavailable)');
+        continue;
+      }
+    }
+    for (let codeTry = 0; codeTry < 3 && !onPayment; codeTry++) {
+      const waitMs = codeTry > 0 ? 8000 : round === 0 ? 45_000 : 60_000;
+      // Bounded from outside too: the wait's own deadline is only checked
+      // between IMAP round-trips, and a half-open socket can hang one forever.
+      const code = await settleWithin(email.waitForBookingCode(waitMs, expectedEmail, triedCodes).catch(() => null), waitMs + 5000, null);
+      if (!code) break;
+      codeSeen = true;
+      triedCodes.add(code);
+      log('✓', `Code via IMAP: ***${code.slice(-2)}${triedCodes.size > 1 ? ` (candidate ${triedCodes.size}; ForeUp refused the previous one)` : ''}`);
+      tev('code_received', { candidate: triedCodes.size, round: round + 1 });
+      await codeInput.fill(code).catch(() => {});
+      // ForeUp's Backbone model only picks the code up from a change event —
+      // fill() alone leaves the model empty (live-verified validation error).
+      await codeInput.dispatchEvent('change').catch(() => {});
+      log('✓', 'Code entered in browser');
+      lastBookError = '';
+      for (let attempt = 0; attempt < 2 && !onPayment; attempt++) {
+        const answer = await bookOnce();
+        onPayment = answer.onPayment;
+        if (onPayment) break;
+        if (answer.error) {
+          lastBookError = answer.error;
+          log('⚠', `ForeUp refused "Book Time": ${answer.error.slice(0, 160)}`);
+          tev('book_refused', { msg: answer.error.slice(0, 200), candidate: triedCodes.size });
+          break; // an explicit refusal: re-clicking the same code cannot help
+        }
+        // No answer at all: most likely the code didn't commit — refire change and retry once.
+        await codeInput.dispatchEvent('change').catch(() => {});
+      }
+      if (!onPayment && !lastBookError) break; // a silent stall is not a wrong code — don't cycle codes on it
     }
   }
-  if (!triedCodes.size) {
-    log('✗', 'No matching fresh code via IMAP — finish by hand: read the code from your email and type it in the browser.');
-    tev('code_timeout', {});
-    return 'manual_needed';
-  }
+  page.off('response', onCheckoutResponse);
   if (!onPayment) {
-    log('✗', 'Never reached the Payment Method screen — finish by hand in the browser (code, Book Time, Pay at Facility).');
+    // Say exactly what the page shows, so a stall is diagnosable from the log.
+    const diag = await page.evaluate(`(() => {
+      const w = window;
+      const out = { bookingError: '', captchaOnline: false, captchaChallenge: false, bookDisabled: false, codeLen: 0, modalUp: false, notice: '' };
+      try {
+        const be = document.querySelector('#booking-error');
+        out.bookingError = be ? (be.textContent || '').trim().slice(0, 200) : '';
+        const cap = w.SETTINGS && w.SETTINGS.enable_captcha_online;
+        out.captchaOnline = cap === true || cap === 1 || cap === '1';
+        const frames = document.querySelectorAll('iframe[src*="recaptcha"]');
+        for (let i = 0; i < frames.length; i++) {
+          const r = frames[i].getBoundingClientRect();
+          if (/bframe/.test(frames[i].src) && r.width > 120 && r.height > 120 && r.top > -1000) out.captchaChallenge = true;
+        }
+        const bb = document.querySelector('button.js-book-button');
+        out.bookDisabled = !!(bb && bb.disabled);
+        const ci = document.querySelector('#reservation_confirmation_uid');
+        out.codeLen = ci && ci.value ? ci.value.length : 0;
+        out.modalUp = !!document.querySelector('#modal .modal-content');
+        const n = document.querySelector('.alert-danger, .alert-error, .notification.error, .toast-error');
+        out.notice = n ? (n.textContent || '').trim().slice(0, 160) : '';
+      } catch (e) { out.notice = String(e).slice(0, 160); }
+      return out;
+    })()`).catch(() => null) as { bookingError: string; captchaOnline: boolean; captchaChallenge: boolean; bookDisabled: boolean; codeLen: number; modalUp: boolean; notice: string } | null;
+    const shot = path.join(__dirname, '..', 'logs', `debug-checkout-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
+    await page.screenshot({ path: shot }).catch(() => {});
+    tev('checkout_stall', { codeSeen, codesTried: triedCodes.size, lastBookError: lastBookError.slice(0, 200), diag, failedResponses: failedResponses.slice(-6) });
+    log('ℹ', `Checkout evidence: ${[
+      `ForeUp message: ${lastBookError || diag?.bookingError || diag?.notice || '(none shown)'}`,
+      `captcha ${diag?.captchaOnline ? 'ON' : 'off'}${diag?.captchaChallenge ? ' — CHALLENGE ON SCREEN' : ''}`,
+      `Book button ${diag?.bookDisabled ? 'disabled' : 'enabled'}`,
+      `code field ${diag?.codeLen ?? '?'} chars`,
+      failedResponses.length ? `failed requests: ${failedResponses.slice(-3).join(' | ')}` : 'no failed requests',
+      `screenshot ${path.basename(shot)}`,
+    ].join(' · ')}`);
+    if (diag?.captchaChallenge) {
+      log('✗', 'ForeUp is showing a reCAPTCHA challenge at "Book Time" — only a person can pass it. Finish by hand in the browser.');
+    } else if (!codeSeen) {
+      log('✗', 'No matching code via IMAP — finish by hand: read the code from your email and type it in the browser.');
+      tev('code_timeout', {});
+    } else {
+      log('✗', 'Never reached the Payment Method screen — finish by hand in the browser (code, Book Time, Pay at Facility).');
+    }
     return 'manual_needed';
   }
 
@@ -2047,7 +2195,10 @@ async function vultureHunt(
   if (cfg.vultureMs <= 0) return { result: 'exhausted' };
   const deadline = t0 + cfg.vultureMs;
   const playerRange = cfg.minPlayers === cfg.players ? `${cfg.players}` : `${cfg.players} preferred, ${cfg.minPlayers} accepted`;
-  log('🦅', `VULTURE mode — hunting freed slots every ${Math.round(cfg.vulturePollMs / 1000)}s until T+${Math.round(cfg.vultureMs / 60_000)}min (${playerRange} players)`);
+  const cadence = cfg.vulturePollMs > 1000
+    ? `every 1s through the +5-minute expiry wave (first ${VULTURE_FAST_PHASE_MS / 60_000} min), then every ${Math.round(cfg.vulturePollMs / 1000)}s`
+    : `every ${Math.round(cfg.vulturePollMs / 1000)}s`;
+  log('🦅', `VULTURE mode — hunting freed slots ${cadence} until T+${Math.round(cfg.vultureMs / 60_000)}min (${playerRange} players)`);
   tev('vulture_start', { preferredPlayers: cfg.players, minPlayers: cfg.minPlayers, deadline, pollMs: cfg.vulturePollMs });
 
   // The initial race is staged for the preferred party size. If a smaller
@@ -2079,7 +2230,9 @@ async function vultureHunt(
   let nextEmailKeepAlive = now() + 5 * 60_000;
   while (now() < deadline) {
     if (now() >= nextEmailKeepAlive) {
-      await email.keepAlive()
+      // Bounded + self-reconnecting: a half-open Gmail socket must not stall a
+      // 12-hour monitor (a bare NOOP has no timeout of its own).
+      await email.ensureFreshBaseline(8000)
         .then(() => log('✓', 'Long-monitor IMAP keepalive ready'))
         .catch((e) => log('⚠', `Long-monitor IMAP keepalive failed; will retry in 5min (${(e as Error).message})`));
       nextEmailKeepAlive = now() + 5 * 60_000;
@@ -2119,10 +2272,139 @@ async function vultureHunt(
         nextHoldAt = now() + 60_000;
       }
     }
-    await sleep(Math.min(cfg.vulturePollMs, Math.max(0, deadline - now())));
+    await sleep(Math.min(vulturePollDelayMs(now() - t0, cfg.vulturePollMs), Math.max(0, deadline - now())));
   }
   log('✗', 'Vulture window closed — nothing came back.');
   return { result: 'exhausted' };
+}
+
+/** The countdown to a release: sleep to T-preDropMs while re-syncing the
+ *  clock near T-30s, re-warming every page's connection pool at T-3.5s and the
+ *  Node keep-alive pool at T-1.5s. Shared by the real drop and the read-only
+ *  --simulate-drop rehearsal, so the rehearsal exercises exactly this code. */
+async function waitForRelease(releaseAt: number, preDropMs: number, api: ForeupClient, pages: Map<string, Page>): Promise<void> {
+  let browserWarmed = false;
+  let poolWarmed = false;
+  let resynced = false;
+  while (releaseAt - now() > preDropMs) {
+    const jumpMs = wallMinusMonoMs();
+    if (jumpMs > 2_000) {
+      // Monotonic time paused (machine slept): the wall clock is authoritative.
+      log('⚠', `Wall clock is ${Math.round(jumpMs)}ms ahead of monotonic time (sleep/wake?) — re-anchoring`);
+      tev('clock_discontinuity', { jumpMs: Math.round(jumpMs) });
+      anchorClock();
+      resynced = false; // re-measure if still inside the T-30..T-10 window
+    }
+    const r = releaseAt - now();
+    // T-30s: re-sync the server clock. It was measured minutes ago at arm
+    // time; a late, close-to-drop reading corrects any drift so the poll
+    // loop is genuinely mid-flight at the true release instant.
+    // Never start a multi-second probe close enough to straddle T=0. A late
+    // startup inside ten seconds keeps the already-trusted initial clock.
+    if (r <= 30_000 && r > 10_000 && !resynced) {
+      resynced = true;
+      // Bounded twice: the probe has its own 6s budget, and this wait loop
+      // regains control no later than T-9s whatever the network does.
+      const fresh = await settleWithin<ClockSync | null>(syncClock(6000, CLOCK_OFFSET_MS).catch(() => null), Math.max(0, r - 9_000), null);
+      if (!fresh || fresh.clock.source === 'local') {
+        log('⚠', 'Clock re-sync near T-30s gave no usable reading — keeping the arm-time offset');
+        tev('clock_resync', { timedOut: !fresh, keptMs: CLOCK_OFFSET_MS });
+        anchorClock(); // same offset, but only the last ≤30s now ride on the undisciplined monotonic clock
+      } else {
+        const driftMs = fresh.clock.offsetMs - CLOCK_OFFSET_MS;
+        if (Math.abs(driftMs) >= 2) logClockSync(fresh, `Clock re-sync near T-30s (drift ${driftMs}ms)`);
+        tev('clock_resync', { fromMs: CLOCK_OFFSET_MS, ...clockTelemetry(fresh) });
+        CLOCK_OFFSET_MS = fresh.clock.offsetMs;
+        anchorClock();
+      }
+    }
+    // T-3.5s: re-warm each page's connection pool so the hold POST doesn't
+    // pay a cold TCP+TLS handshake — the pages have been idle for minutes.
+    if (r <= 3500 && !browserWarmed) {
+      browserWarmed = true;
+      for (const p of pages.values()) {
+        p.evaluate(`fetch('/robots.txt', { cache: 'no-store' }).catch(() => {})`).catch(() => {});
+      }
+    }
+    // T-1.5s: open one warm keep-alive socket per first-wave poll lane
+    // (undici closes idle sockets after ~4s; the last Node request was the
+    // T-30 re-sync), so the drop polls skip DNS+TCP+TLS entirely.
+    if (r <= 1500 && !poolWarmed) {
+      poolWarmed = true;
+      const sockets = poolWarmSockets(cfg.pollConcurrency, cfg.courses.length);
+      const startedAt = now();
+      api.warmPool(sockets).then((ok) => tev('pool_warm', { sockets, ok, atMs: startedAt - releaseAt, ms: now() - startedAt })).catch(() => {});
+    }
+    if (r > 5000) await sleep(1000);
+    else if (r > 1600) await sleep(50);
+    else await sleep(Math.max(1, Math.min(5, r - preDropMs))); // tight loop near poll start
+  }
+}
+
+/** --dry-run --simulate-drop [seconds]: a read-only rehearsal of the part of a
+ *  drop no leftover-sheet test can reach. It pretends the release is N seconds
+ *  away, then runs the REAL countdown (clock re-sync, page + pool warm-ups) and
+ *  the REAL poll schedule against the target sheet for three seconds, and
+ *  grades what happened. It only ever polls — there is no hold code on this
+ *  path — so it is safe to run any time, on any machine. */
+async function simulateDrop(
+  api: ForeupClient, pages: Map<string, Page>, date: string, leadS: number, preDropMs: number, sheetAlreadyLive: boolean,
+): Promise<void> {
+  const releaseAt = Math.ceil((now() + leadS * 1000) / 1000) * 1000;
+  log('…', `SIM DROP: rehearsing a release in ${Math.round((releaseAt - now()) / 1000)}s — real countdown, clock re-sync, warm-ups and poll schedule (read-only, zero holds)`);
+  const firstEvent = TEL.events.length;
+  await waitForRelease(releaseAt, preDropMs, api, pages);
+  const loopExitLateMs = now() - (releaseAt - preDropMs);
+  telT0 = releaseAt;
+  TEL.timingBasis = 'run_start'; // never mistaken for a real release in calibration
+  const stop: StopToken = { stopped: false };
+  const stopTimer = setTimeout(() => { stop.stopped = true; }, Math.max(0, releaseAt + 3000 - now()));
+  await Promise.all(cfg.courses.map((c) => racePoll(api, date, c, stop, releaseAt, 400)));
+  clearTimeout(stopTimer);
+  stop.stopped = true;
+  await sleep(1500); // let in-flight polls and the pool-warm report land
+  telT0 = 0;
+
+  const ev = TEL.events.slice(firstEvent);
+  const polls = ev.filter((e) => e.name === 'poll' && typeof e.sentMs === 'number') as Array<{ course: string; sentMs: number; rtt: number; kind: string }>;
+  const kinds: Record<string, number> = {};
+  for (const p of polls) kinds[p.kind] = (kinds[p.kind] ?? 0) + 1;
+  const pct = (xs: number[], q: number) => (xs.length ? xs[Math.min(xs.length - 1, Math.floor(xs.length * q))] : null);
+  const emptyRtt = polls.filter((p) => p.kind === 'empty').map((p) => p.rtt).sort((a, b) => a - b);
+  const firstSent = polls.length ? Math.min(...polls.map((p) => p.sentMs)) : null;
+  let maxDenseGap = 0;
+  let densePolls = 0;
+  for (const c of cfg.courses) {
+    const sent = polls.filter((p) => p.course === c.key && p.sentMs >= -350 && p.sentMs < 400).map((p) => p.sentMs).sort((a, b) => a - b);
+    densePolls += sent.length;
+    for (let i = 1; i < sent.length; i++) maxDenseGap = Math.max(maxDenseGap, sent[i] - sent[i - 1]);
+  }
+  const warm = ev.find((e) => e.name === 'pool_warm') as { sockets?: number; ok?: number; ms?: number } | undefined;
+  const resync = ev.find((e) => e.name === 'clock_resync') as { timedOut?: boolean; offsetMs?: number; fromMs?: number } | undefined;
+
+  const problems: string[] = [];
+  if (firstSent === null) problems.push('no poll was sent');
+  else if (firstSent > -preDropMs + 100) problems.push(`first poll left at T${firstSent}ms — later than T-${preDropMs}ms +100`);
+  if (kinds.rejected || kinds.blocked) problems.push(`detector answered ${kinds.rejected ? `rejected×${kinds.rejected} ` : ''}${kinds.blocked ? `blocked×${kinds.blocked}` : ''} under drop-rate polling`.trim());
+  if ((kinds.error ?? 0) > Math.max(2, polls.length * 0.05)) problems.push(`${kinds.error} polls failed (network/timeouts)`);
+  if (!kinds.times && densePolls < 8 * cfg.courses.length) problems.push(`only ${densePolls} polls in the dense window`);
+  if (!warm) problems.push('pool warm-up did not report');
+  else if ((warm.ok ?? 0) < (warm.sockets ?? 1)) problems.push(`pool warm-up opened ${warm.ok}/${warm.sockets} sockets`);
+  if (!resync) problems.push('T-30 clock re-sync did not run');
+
+  const summary = [
+    `countdown reached T-${preDropMs}ms ${loopExitLateMs >= 0 ? '+' : ''}${loopExitLateMs}ms`,
+    firstSent !== null ? `first poll T${firstSent}ms` : null,
+    resync ? (resync.timedOut ? 're-sync kept arm-time clock' : `re-sync ok (${(resync.offsetMs ?? 0) - (resync.fromMs ?? 0) >= 0 ? '+' : ''}${(resync.offsetMs ?? 0) - (resync.fromMs ?? 0)}ms drift)`) : null,
+    warm ? `pool warm ${warm.ok}/${warm.sockets} in ${warm.ms}ms` : null,
+    `${polls.length} polls ${JSON.stringify(kinds)}`,
+    emptyRtt.length ? `not-released RTT p50 ${pct(emptyRtt, 0.5)}ms / p95 ${pct(emptyRtt, 0.95)}ms` : null,
+    densePolls ? `dense window ${densePolls} polls, longest gap ${maxDenseGap}ms` : null,
+    kinds.times || sheetAlreadyLive ? 'sheet already live — use an unreleased date to rehearse the full poll schedule' : null,
+  ].filter(Boolean).join(' · ');
+  tev('sim_drop', { ok: problems.length === 0, problems, loopExitLateMs, firstSentMs: firstSent, polls: polls.length, kinds, emptyRttP50: pct(emptyRtt, 0.5), emptyRttP95: pct(emptyRtt, 0.95), densePolls, maxDenseGapMs: maxDenseGap });
+  if (problems.length) log('✗', `SIM DROP: ${problems.join('; ')} — ${summary}`);
+  else log('✓', `SIM DROP: ${summary}`);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -2171,7 +2453,7 @@ async function main() {
 
   // ── Setup ─────────────────────────────────────────────
   log('…', 'Browser bootstrap');
-  const { context, pages } = await bootstrap(date);
+  const { context, pages } = await bootstrapWithRetry(date);
 
   // NTP is the base; ForeUp's Date header corrects it only when its causal
   // interval proves ForeUp's clock (which gates the drop) is elsewhere.
@@ -2193,9 +2475,21 @@ async function main() {
   const needEmail = cfg.courses.some((c) => c.emailCode);
   const email = new EmailMonitor(cfg.gmailEmail, cfg.gmailAppPassword);
   if (needEmail) {
+    // The code email is only needed at checkout, minutes from now. A Gmail
+    // blip at arm time must not cancel the race: try three times, then race
+    // anyway — checkout reconnects (ensureFreshBaseline) before it needs it.
     log('…', 'IMAP connect');
-    await email.connect();
-    log('✓', 'IMAP ready');
+    let imapOk = false;
+    let imapErr = '';
+    for (let attempt = 1; attempt <= 3 && !imapOk; attempt++) {
+      imapOk = await settleWithin(email.connect().then(() => true).catch((e) => { imapErr = String((e as Error)?.message ?? e); return false; }), 15_000, false);
+      if (!imapOk && attempt < 3) await sleep(2000);
+    }
+    if (imapOk) log('✓', 'IMAP ready');
+    else {
+      log('⚠', `IMAP not connected (${imapErr || 'timed out'}) — racing anyway; checkout reconnects before it needs the code`);
+      tev('imap_unavailable', { err: imapErr.slice(0, 160) });
+    }
   } else {
     log('ℹ', 'No email code needed for this course — skipping IMAP');
   }
@@ -2223,7 +2517,10 @@ async function main() {
   if (DRY_RUN) {
     if (SPEC && !BRIDGE_OFF && cfg.race) {
       log('…', 'SPEC scout (read-only dry run): validating predicted slots from published/saved sheets');
-      const scouted = await buildSpecCandidates(api, date);
+      const scouted = await buildSpecCandidates(api, date).catch((e) => {
+        log('⚠', `SPEC scout failed (${(e as Error).message}) — spec disabled, detect path only`);
+        return new Map<string, Candidate[]>();
+      });
       const preferred = cfg.courses[0];
       const ranked = preferred ? scouted.get(preferred.key) : undefined;
       if (preferred && ranked?.length) {
@@ -2233,6 +2530,7 @@ async function main() {
       }
     }
     if (CAPTURE_DROP) await captureDropSheets(api, date, sheetAlreadyLive);
+    if (SIM_DROP_LEAD_S !== null) await simulateDrop(api, pages, date, SIM_DROP_LEAD_S, preDropMs, sheetAlreadyLive);
     log('🏁', 'DRY RUN done.');
     tev('outcome', { result: 'dry_run_ok' }); saveTelemetry();
     await cleanup();
@@ -2252,7 +2550,11 @@ async function main() {
     else if (!cfg.race) log('⚠', 'SPEC requires race mode — spec disabled');
     else {
       log('…', 'SPEC scout: building the slot template from published neighbor dates');
-      const scouted = await buildSpecCandidates(api, date);
+      const scouted = await buildSpecCandidates(api, date).catch((e) => {
+        log('⚠', `SPEC scout failed (${(e as Error).message}) — spec disabled, detect path only`);
+        tev('spec_scout_error', { err: String((e as Error)?.message ?? e).slice(0, 160) });
+        return new Map<string, Candidate[]>();
+      });
       // SPEC is reserved for the first configured course (red in red,green).
       // A lower-priority blind hold must not preempt an unknown Red sheet;
       // normal API detection still races every configured course underneath.
@@ -2275,62 +2577,17 @@ async function main() {
   const wait = releaseAt - now() - preDropMs;
   if (wait > 0 && scheduledDrop) {
     log('⏳', `${Math.floor(wait / 60000)}m ${Math.ceil((wait % 60000) / 1000)}s until T-${preDropMs}ms`);
-    let browserWarmed = false;
-    let poolWarmed = false;
-    let resynced = false;
-    while (releaseAt - now() > preDropMs) {
-      const jumpMs = wallMinusMonoMs();
-      if (jumpMs > 2_000) {
-        // Monotonic time paused (machine slept): the wall clock is authoritative.
-        log('⚠', `Wall clock is ${Math.round(jumpMs)}ms ahead of monotonic time (sleep/wake?) — re-anchoring`);
-        tev('clock_discontinuity', { jumpMs: Math.round(jumpMs) });
-        anchorClock();
-        resynced = false; // re-measure if still inside the T-30..T-10 window
-      }
-      const r = releaseAt - now();
-      // T-30s: re-sync the server clock. It was measured minutes ago at arm
-      // time; a late, close-to-drop reading corrects any drift so the poll
-      // loop is genuinely mid-flight at the true release instant.
-      // Never start a multi-second probe close enough to straddle T=0. A late
-      // startup inside ten seconds keeps the already-trusted initial clock.
-      if (r <= 30_000 && r > 10_000 && !resynced) {
-        resynced = true;
-        // Bounded twice: the probe has its own 6s budget, and this wait loop
-        // regains control no later than T-9s whatever the network does.
-        const fresh = await settleWithin<ClockSync | null>(syncClock(6000, CLOCK_OFFSET_MS).catch(() => null), Math.max(0, r - 9_000), null);
-        if (!fresh || fresh.clock.source === 'local') {
-          log('⚠', 'Clock re-sync near T-30s gave no usable reading — keeping the arm-time offset');
-          tev('clock_resync', { timedOut: !fresh, keptMs: CLOCK_OFFSET_MS });
-          anchorClock(); // same offset, but only the last ≤30s now ride on the undisciplined monotonic clock
-        } else {
-          const driftMs = fresh.clock.offsetMs - CLOCK_OFFSET_MS;
-          if (Math.abs(driftMs) >= 2) logClockSync(fresh, `Clock re-sync near T-30s (drift ${driftMs}ms)`);
-          tev('clock_resync', { fromMs: CLOCK_OFFSET_MS, ...clockTelemetry(fresh) });
-          CLOCK_OFFSET_MS = fresh.clock.offsetMs;
-          anchorClock();
-        }
-      }
-      // T-3.5s: re-warm each page's connection pool so the hold POST doesn't
-      // pay a cold TCP+TLS handshake — the pages have been idle for minutes.
-      if (r <= 3500 && !browserWarmed) {
-        browserWarmed = true;
-        for (const p of pages.values()) {
-          p.evaluate(`fetch('/robots.txt', { cache: 'no-store' }).catch(() => {})`).catch(() => {});
-        }
-      }
-      // T-1.5s: open one warm keep-alive socket per first-wave poll lane
-      // (undici closes idle sockets after ~4s; the last Node request was the
-      // T-30 re-sync), so the drop polls skip DNS+TCP+TLS entirely.
-      if (r <= 1500 && !poolWarmed) {
-        poolWarmed = true;
-        const sockets = poolWarmSockets(cfg.pollConcurrency, cfg.courses.length);
-        const startedAt = now();
-        api.warmPool(sockets).then((ok) => tev('pool_warm', { sockets, ok, atMs: startedAt - releaseAt, ms: now() - startedAt })).catch(() => {});
-      }
-      if (r > 5000) await sleep(1000);
-      else if (r > 1600) await sleep(50);
-      else await sleep(Math.max(1, Math.min(5, r - preDropMs))); // tight loop near poll start
+    // The IMAP session has idled since setup and is next needed seconds after
+    // a hold. Refresh it at T-20s (bounded, self-reconnecting, off the hot
+    // path) so checkout never starts on a silently dead socket.
+    if (needEmail && wait > 25_000) {
+      setTimeout(() => {
+        email.ensureFreshBaseline(5000)
+          .then(() => tev('imap_keepwarm', { ok: true }))
+          .catch((e) => { tev('imap_keepwarm', { ok: false, err: String((e as Error)?.message ?? e).slice(0, 120) }); log('⚠', `IMAP refresh before the drop failed (${(e as Error).message}) — checkout will reconnect`); });
+      }, Math.max(0, releaseAt - now() - 20_000));
     }
+    await waitForRelease(releaseAt, preDropMs, api, pages);
   }
 
   // ══════════════════════════════════════════════════════

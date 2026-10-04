@@ -11,12 +11,13 @@ import * as fs from 'fs';
 import { bookingCodeContextMatches, EmailMonitor, pickBookingCode } from './email-monitor';
 import {
   bookingFeeTotal, classifyTimesResponse, etDropTargetDate, firstModalIdentityMismatch, isSoftLimitRejection, missingSpecTemplateFields,
-  pollPhase, poolWarmSockets, settleWithin, specRunMode, vultureRetryDelayMs,
+  pollPhase, poolWarmSockets, settleWithin, specRunMode, vulturePollDelayMs, vultureRetryDelayMs,
 } from './turbo-guards';
 import {
   causalOffsetInterval, fuseClockOffset, pickNtpSample, planPreDropMs, planSpecOffsets, probeServerDate,
   releaseSendBracket, summarizeReleaseRuns, type DateSample,
 } from './clock-sync';
+import { armMarker, armTimerCmd, attachCmd, cancelTimerCmd } from './remote-arm';
 import {
   dayClassOf, fullRateAnchorOf, isoDate, isWeekendDate, latticePhase, latticeStep, mergeSpecTemplate, pickFullRateAnchor,
   predictWindowFromAnchor, snapshotFileName, specPayloadDiff, specPredictTimes, specScoutDates, specShotIsLate, specShotTarget,
@@ -1182,6 +1183,18 @@ section('Turbo safety guards — production helpers');
   assertDeepEqual(pollPhase(-350, 6, 12), { maxInFlight: 6, minGapMs: 15 }, 'poll phase: dense from T-350');
   assertDeepEqual(pollPhase(399, 6, 30), { maxInFlight: 6, minGapMs: 30 }, 'poll phase: dense respects a wider stagger');
   assertDeepEqual(pollPhase(400, 6, 12), { maxInFlight: 6, minGapMs: 50 }, 'poll phase: backs off after T+400');
+  assertDeepEqual(pollPhase(4999, 6, 12), { maxInFlight: 6, minGapMs: 50 }, 'poll phase: still brisk until T+5s');
+  assertDeepEqual(pollPhase(5000, 6, 12), { maxInFlight: 2, minGapMs: 250 }, 'poll phase: a late release gets a slow tail, not a 30s burnout');
+  // Budget check: 600 polls must cover a release that is two minutes late.
+  {
+    let t = -1000, launched = 0;
+    while (launched < 600) { const ph = pollPhase(t, 6, 12)!; launched++; t += ph.minGapMs; }
+    assert(t >= 120_000 - 5000, `poll phase: 600-poll budget reaches T+${Math.round(t / 1000)}s (≥ ~2 min of late-release cover)`);
+  }
+  assertEqual(vulturePollDelayMs(0, 60_000), 1000, 'vulture cadence: fast right after a lost race even with a 60s monitor cadence');
+  assertEqual(vulturePollDelayMs(5 * 60_000 + 500, 60_000), 1000, 'vulture cadence: still fast through the +5-minute expiry wave');
+  assertEqual(vulturePollDelayMs(8 * 60_000, 60_000), 60_000, 'vulture cadence: the long-monitor cadence resumes after the fast phase');
+  assertEqual(vulturePollDelayMs(0, 750), 750, 'vulture cadence: an already-faster configured cadence is kept');
   assertEqual(poolWarmSockets(6, 2), 12, 'pool warm: one socket per first-wave lane');
   assertEqual(poolWarmSockets(6, 3), 12, 'pool warm: capped');
   assertEqual(poolWarmSockets(0, 2), 1, 'pool warm: at least one');
@@ -1270,12 +1283,33 @@ section('Dashboard SPEC passthrough — ui-server.ts wiring contract');
 {
   const ui = fs.readFileSync('src/ui-server.ts', 'utf8');
   const html = fs.readFileSync('static/turbo-ui.html', 'utf8');
-  assert(/let schedule: \{[^\n]*spec\?: boolean/.test(ui), 'dashboard spec: schedule stores optional flag');
+  assert(/interface Schedule \{[^\n]*spec\?: boolean/.test(ui), 'dashboard spec: schedule stores optional flag');
   assert(/function setSchedule\([^\n]*spec\?: boolean\)/.test(ui), 'dashboard spec: setSchedule accepts flag');
   assert(ui.includes('schedule = { mode, at: at.getTime(), courses, target, players, date, spec };'), 'dashboard spec: setSchedule persists flag');
-  assert(ui.includes('arm(s.mode, s.date, s.courses ?? undefined, s.target, s.players, s.spec)'), 'dashboard spec: scheduled replay forwards flag');
+  assertEqual(ui.match(/arm\(s\.mode, s\.date, s\.courses \?\? undefined, s\.target, s\.players, s\.spec, /g)?.length ?? 0, 2, 'dashboard spec: scheduled replay forwards flag (attach and start paths)');
   assert(ui.includes('spec: schedule.spec ?? false'), 'dashboard spec: /api/state exposes explicit boolean');
-  assert(/async function arm\([^\n]*spec\?: boolean\)/.test(ui), 'dashboard spec: arm accepts flag');
+  assert(/async function arm\([^\n]*spec\?: boolean, sched:/.test(ui), 'dashboard spec: arm accepts flag');
+  // Auto-arm bulletproofing: the box fires on its own, the schedule survives a
+  // restart, a stale arm never starts a run, and a cancel must be confirmed.
+  assert(ui.includes('const cmd = armTimerCmd(s.at, runCmd);') && ui.includes('const remoteCmd = attachCmd(runCmd, sched);'), 'auto-arm: remote schedules get a box-side timer; the Mac attaches');
+  assert(ui.includes('{ schedAt: s.at, allowCreate: lateMs < STALE_ARM_MS }'), 'auto-arm: a late-firing box-armed schedule attaches only — never starts a stale run');
+  assert(ui.includes('} else if (lateMs < STALE_ARM_MS) {') && ui.includes('was missed (this Mac was asleep or the dashboard was down)'), 'auto-arm: a missed local arm is reported, not started hours late');
+  assert(ui.includes('const bad = validateCourses(courses); // these values are embedded in a remote command'), 'auto-arm: course keys are validated before entering a shell command');
+  assert(ui.includes("if (!r.ok) { json(res, 200, { ok: false, error: `Could not reach the box to cancel its timer"), 'auto-arm: an unconfirmed cancel is an error, not a silent success');
+  assert(ui.includes('fs.writeFileSync(SCHEDULE_PATH, JSON.stringify(schedule));') && ui.includes('void restoreSchedule();'), 'auto-arm: the schedule is saved and restored across restarts');
+  assert(ui.includes("const fireAt = schedule.at + (schedule.target !== 'mac' ? REMOTE_ATTACH_DELAY_MS : 0);"), 'auto-arm: the Mac attaches after the box has started the run');
+  {
+    const at = 1_791_000_000_000;
+    const place = armTimerCmd(at, 'HEADLESS=1 AUTO_BOOK=1 npx tsx src/turbo.ts --race --course black,red --players 4');
+    assert(place.includes('tmux rename-session -t "=armtimer" snipe || exit 0'), 'arm timer: becomes the run session, or exits if one is live');
+    assert(place.includes(`S=$(( ${at / 1000} - $(date +%s) ))`) && place.includes('echo ARMTIMER_OK'), 'arm timer: sleeps to the absolute arm time on the box’s own clock and confirms');
+    assert(!/-t =/.test(place + attachCmd('x', {}) + cancelTimerCmd(true)), 'arm timer: exact-match targets are always quoted (zsh-safe)');
+    assert(attachCmd('x', { schedAt: at, allowCreate: false }).includes('too late to start it now') && !attachCmd('x', { schedAt: at, allowCreate: false }).includes('new-session'), 'attach: the stale form contains no way to start a run');
+    assert(attachCmd('x', { schedAt: at, allowCreate: true }).includes(armMarker(at)) && armMarker(at) === '# armtimer 1791000000', 'attach: recognises the box-started run by its marker');
+    assert(cancelTimerCmd(false).includes('echo ARMTIMER_STILL || echo ARMTIMER_GONE') && !cancelTimerCmd(false).includes('pkill'), 'cancel: confirms removal; only a just-fired timer also stops its run');
+    let threw = false; try { attachCmd("x'; rm -rf ~; '", {}); } catch { threw = true; }
+    assert(threw, 'remote commands: a run command with a quote is refused');
+  }
   assert(ui.includes("if (spec) turboFlags.push('--spec');"), 'dashboard spec: arm emits --spec');
   assert(ui.includes("const envPrefix = `HEADLESS=1 ${mode === 'live' ? 'AUTO_BOOK=1 ' : ''}`;"), 'dashboard remote safety: every AWS/VM command forces headless mode independently of .env');
   assertEqual(ui.match(/body\.spec === true/g)?.length ?? 0, 2, 'dashboard spec: both API handlers require strict true');
@@ -1291,12 +1325,13 @@ section('Turbo race-policy wiring contract');
 
 {
   const turbo = fs.readFileSync('src/turbo.ts', 'utf8');
+  const uiSrcEarly = fs.readFileSync('src/ui-server.ts', 'utf8');
   assert(turbo.includes('function foreupServerOffset(priorOffsetMs: number | null, budgetMs = 6000)'), 'clock sync: ForeUp probe is NTP-aimed and hard-bounded');
   assert(turbo.includes('settleWithin<ClockSync | null>(syncClock(6000, CLOCK_OFFSET_MS).catch(() => null), Math.max(0, r - 9_000), null)'), 'clock sync: T-30 re-sync returns control by T-9s and keeps the prior offset as its base');
   assert(turbo.includes("if (crashing) return 'manual_needed';"), 'crash safety: a crash cleanup and the charging click never overlap');
   assert(turbo.includes('handedOffPages.has(p)'), 'crash safety: a hold handed to the human is never auto-released');
   assert(turbo.includes('(ABORT_BEFORE_BOOK || TEST_PAYMENT) && !paymentSubmitted'), 'test modes: a checkout error releases the $0 hold');
-  assert(turbo.includes('const maxCodes = sameTimeElsewhere ? 3 : 1;'), 'checkout email: retries only when a look-alike code can exist');
+  assert(turbo.includes('for (let codeTry = 0; codeTry < 3 && !onPayment; codeTry++)'), 'checkout email: at most three codes per round');
   assert(turbo.includes('CLOCK_OFFSET_MS = sync.clock.offsetMs;\n  anchorClock();'), 'clock sync: every adopted offset re-anchors the monotonic clock');
   assert(turbo.includes("const t0 = scheduledDrop ? releaseAt : pollStartedAt;"), 'race timing: scheduled drop uses fixed release epoch');
   assert(turbo.includes("if (run.timingBasis !== 'server_release') continue;"), 'race timing: legacy poll-relative telemetry excluded');
@@ -1317,7 +1352,7 @@ section('Turbo race-policy wiring contract');
   assert(turbo.includes("out.release = typeof w.Utils?.OnlineBooking?.Reservation?.deletePending === 'function';"), 'hold safety: dry-run bridge preflight verifies native release support');
   assert(turbo.includes("r.request().method() === 'DELETE'") && turbo.includes('Reservation?.deletePending'), 'hold safety: loser release observes DELETE and has one native fallback');
   assert(turbo.includes("log('⚠', 'A loser hold could not be verified released — checkout blocked');"), 'hold safety: unverified loser blocks payment');
-  assert(turbo.includes('Waiting for the fresh winner booking code via IMAP (matched by date + time)'), 'email safety: checkout requests a fresh winner-only code');
+  assert(turbo.includes('Waiting for the booking code via IMAP (matched by date + time)'), 'email safety: the code is matched to the held date + time');
   assert(turbo.includes("time24: cand.t.time.split(' ')[1] ?? ''"), 'email safety: accepted code is bound to held date + time');
   assert(turbo.includes('if (finalized.result === \'exhausted\' && held.length && detected.length)'), 'spec fallback: released SPEC/gate failure consumes buffered detection immediately');
   assert(turbo.includes('fs.renameSync(tmpPath, finalPath);'), 'snapshots: atomic immutable capture write');
@@ -1345,7 +1380,29 @@ section('Turbo race-policy wiring contract');
   assert(turbo.includes('if (paymentSubmitted) {'), 'crash safety: nothing is released after PROCESS TRANSACTION');
   assert(turbo.includes('const result = await completeBookingSafe('), 'checkout: throws become manual_needed, not crashes');
   assert(turbo.includes('await email.ensureFreshBaseline(6000)') || turbo.includes('email.ensureFreshBaseline(6000)'), 'checkout email: bounded self-reconnecting baseline');
-  assert(turbo.includes('waitForBookingCode(codeTry === 0 ? 70_000 : 30_000, expectedEmail, triedCodes)'), 'checkout email: a rejected code is excluded and the next matching code tried');
+  assert(turbo.includes('settleWithin(email.waitForBookingCode(waitMs, expectedEmail, triedCodes).catch(() => null), waitMs + 5000, null)'), 'checkout email: the code wait is bounded and excludes rejected codes');
+  // The code step, as proven live on 2026-10-04: no upfront resend (it races a
+  // second, different code), read ForeUp's own answer, resend only when needed.
+  const codeStep = turbo.slice(turbo.indexOf('// 5 + 6. The emailed code'), turbo.indexOf('// 7. Money gate #3'));
+  assert(codeStep.includes('if (round === 1 || !email.isHealthy()) {') && codeStep.split('await requestFreshCode()').length === 2, 'checkout email: a fresh code is only requested when none arrived, all were refused, or IMAP had to reconnect');
+  assert(codeStep.includes("document.querySelector('#booking-error')") && codeStep.includes('ForeUp refused "Book Time"'), 'checkout: ForeUp’s own refusal message is read, not guessed from a timeout');
+  assert(codeStep.includes('break; // an explicit refusal: re-clicking the same code cannot help') && codeStep.includes("if (!onPayment && !lastBookError) break;"), 'checkout: a refused code moves to the next candidate; a silent stall does not cycle codes');
+  assert(codeStep.includes('Checkout evidence:') && codeStep.includes("tev('checkout_stall'") && codeStep.includes('page.screenshot({ path: shot })'), 'checkout: a stall records what the page showed (message, captcha state, failed requests, screenshot)');
+  assert(codeStep.includes('only a person can pass it'), 'checkout: a reCAPTCHA challenge is reported as such, never automated');
+  assert(codeStep.indexOf("if (!course.emailCode) {") < codeStep.indexOf('const requestFreshCode'), 'checkout: no-fee schedules stop before any code logic');
+  assert(turbo.includes("resend.click({ timeout: 8000 })"), 'checkout email: the resend click cannot hang the hold');
+  assert(turbo.includes('const { context, pages } = await bootstrapWithRetry(date);'), 'setup: a transient bootstrap failure is retried in a fresh browser');
+  assert(turbo.includes('await browser.close().catch(() => {});\n    throw e;'), 'setup: a failed bootstrap closes its browser before the retry');
+  assert(turbo.includes('racing anyway; checkout reconnects before it needs the code'), 'setup: an IMAP failure at arm time never cancels the race');
+  assert(turbo.includes('await waitForRelease(releaseAt, preDropMs, api, pages);'), 'countdown: the real drop and the rehearsal share one wait loop');
+  assert(turbo.includes('email.ensureFreshBaseline(5000)') && turbo.includes('Math.max(0, releaseAt - now() - 20_000)'), 'countdown: the IMAP session is refreshed at T-20s, off the hot path');
+  assert(turbo.includes('out.nameEntry = !!(w.App.settings && w.App.settings.allow_name_entry);') && turbo.includes('const namesBlock = p.nameEntry && cfg.players > 1;'), 'preflight: a player-names screen before payment is flagged before the drop');
+  assert(turbo.includes("out.captchaOnline = cap === true || cap === 1 || cap === '1';") && turbo.includes('!namesBlock && !p.captchaOnline'), 'preflight: a Book Time reCAPTCHA is flagged before the drop');
+  assert(uiSrcEarly.includes("if (mode === 'dry' && hm >= 18 * 60 && hm < 19 * 60) {"), 'dashboard: a systems-check auto-arm right before the drop warns that nothing will race');
+  const sim = turbo.slice(turbo.indexOf('async function simulateDrop'), turbo.indexOf('// Main\n'));
+  assert(sim.includes('await waitForRelease(releaseAt, preDropMs, api, pages);') && sim.includes('racePoll(api, date, c, stop, releaseAt, 400)'), 'sim drop: rehearses the real countdown and poll schedule');
+  assert(!/holdViaBridge|holdPhase|specStrike|browserBook|attemptCandidates|completeBooking/.test(sim), 'sim drop: read-only — no hold or checkout code on its path');
+  assert(turbo.includes("if (SIM_DROP_LEAD_S !== null) await simulateDrop(") && turbo.indexOf('if (SIM_DROP_LEAD_S !== null)') > turbo.indexOf('if (DRY_RUN) {'), 'sim drop: only reachable inside --dry-run');
   assert(!/isVisible\(\{ timeout/.test(turbo), 'playwright: no ignored isVisible timeouts remain');
   assert(turbo.includes("pBtn.waitFor({ state: 'visible', timeout: 3000 })"), 'money gate #2 waits for the in-modal players chip');
   assert(turbo.includes("const specTest = specMode === 'live_sheet_test';"), 'spec: live-sheet single shot is $0-only');
@@ -1380,8 +1437,8 @@ section('Turbo race-policy wiring contract');
   assert(turbo.includes('api.pollTimes(date, course, undefined, cfg.minPlayers)'), 'player fallback: recovery API includes three-player openings');
   assert(turbo.includes('rankCandidates(times, course, cfg.minPlayers, cfg.players)'), 'player fallback: recovery prefers four but accepts three');
   assert(turbo.includes("vulturePollMs: Math.max(750, argInt('vulture-poll-sec'"), 'long monitor: cancellation polling cadence is explicitly configurable');
-  assert(turbo.includes('await email.keepAlive()'), 'long monitor: IMAP is kept healthy while waiting for a late cancellation');
-  assert(turbo.includes('Math.min(cfg.vulturePollMs, Math.max(0, deadline - now()))'), 'long monitor: polling sleeps to the configured cadence without crossing its deadline');
+  assert(turbo.includes('await email.ensureFreshBaseline(8000)'), 'long monitor: IMAP is kept healthy (bounded, self-reconnecting) while waiting for a late cancellation');
+  assert(turbo.includes('Math.min(vulturePollDelayMs(now() - t0, cfg.vulturePollMs), Math.max(0, deadline - now()))'), 'long monitor: fast through the expiry wave, then the configured cadence, never past its deadline');
   const emailMonitor = fs.readFileSync('src/email-monitor.ts', 'utf8');
   assert(emailMonitor.includes('if (!this.connected || !this.client.usable)'), 'long monitor email: dead IMAP sockets trigger reconnect');
   assert(emailMonitor.includes('await this.resetBaseline();'), 'long monitor email: healthy IMAP sockets receive a keepalive NOOP');
